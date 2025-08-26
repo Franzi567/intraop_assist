@@ -176,8 +176,15 @@ class MainWindow(QMainWindow):
 
         # Start Video Thread
         self.vthread = VideoThread(src=1, width=1280, height=720)
+        # after creating self.vthread
+        self.vthread.connection_changed.connect(self.set_connection_status)
+
         self.vthread.frame_ready.connect(self.update_video_frame)
         self.vthread.start()
+
+        self.record = QLabel("Aufnahme läuft")
+        self.record.setObjectName("RecordPill")
+        self.record.setProperty("connected", False)
 
         # Slider + ROI + Kommentar (unter dem Video)
         self.overlay_slider = QSlider(Qt.Horizontal)
@@ -240,14 +247,22 @@ class MainWindow(QMainWindow):
         root.addWidget(left_wrap, 2)
         root.addWidget(model_card, 3)
 
+    def set_connection_status(self, connected: bool):
+        if connected:
+            self.record.setProperty("connected", True)
+            self.record.setStyleSheet(self.styleSheet())  # force reapply
+        else:
+            self.record.setProperty("connected", False)
+            self.record.setStyleSheet(self.styleSheet())
     # --- Video frame update ---
     def update_video_frame(self, rgb):
-        if self.vessel_toggle.isChecked():
-            # TODO: Overlay vessels here later
-            pass
+        # mark camera as connected
+        if not self.record.property("connected"):
+            self.record.setProperty("connected", True)
+            self.record.setStyleSheet(self.styleSheet())  # reapply CSS
+
         h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
         self.video_label.setPixmap(QPixmap.fromImage(qimg))
 
     def closeEvent(self, event):
@@ -307,6 +322,27 @@ class MainWindow(QMainWindow):
     border-radius: 8px;
     padding: 4px 8px;
 }
+#Pill {
+    border-radius: 999px;       /* fully round */
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 500;
+}
+#RecordPill {
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    background: #111827;   /* default black */
+    color: white;
+}
+#RecordPill[connected="true"] {
+    background: #3B82F6;   /* blue when connected */
+    color: white;
+}
+
+
+
 #TopBtn:hover { background: #F3F4F6; }
 
         """)

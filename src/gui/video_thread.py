@@ -1,31 +1,43 @@
-import cv2
-import numpy as np
 from PySide6.QtCore import QThread, Signal
+import cv2
 
 class VideoThread(QThread):
-    frame_ready = Signal(np.ndarray)
+    frame_ready = Signal(object)
+    connection_changed = Signal(bool)   # <-- new signal
 
-    def __init__(self, src=1, width=None, height=None, parent=None):
-        super().__init__(parent)
-        self.src = int(src) if str(src).isdigit() else src
-        self.width, self.height = width, height
+    def __init__(self, src=0, width=640, height=480):
+        super().__init__()
+        self.src = src
+        self.width = width
+        self.height = height
         self._running = True
+        self._connected = False
 
     def run(self):
-        cap = cv2.VideoCapture(self.src, cv2.CAP_ANY)
-        if self.width:  cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        if self.height: cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # reduce latency if supported
+        cap = cv2.VideoCapture(self.src)
+        if not cap.isOpened():
+            self.connection_changed.emit(False)
+            return
+
+        self.connection_changed.emit(True)
+        self._connected = True
 
         while self._running:
             ok, frame = cap.read()
             if not ok:
-                self.msleep(20)
+                if self._connected:
+                    self.connection_changed.emit(False)
+                    self._connected = False
                 continue
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            self.frame_ready.emit(rgb)
+            else:
+                if not self._connected:
+                    self.connection_changed.emit(True)
+                    self._connected = True
+
+                self.frame_ready.emit(frame[..., ::-1])  # BGR→RGB
 
         cap.release()
 
     def stop(self):
         self._running = False
+        self.wait()
