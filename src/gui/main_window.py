@@ -1,348 +1,263 @@
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel,
-    QPushButton, QSlider, QProgressBar, QFrame, QSizePolicy, QLineEdit, QCheckBox,
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
+    QLabel, QPushButton, QSlider, QLineEdit, QPlainTextEdit,
+    QStatusBar, QFrame, QSizePolicy
 )
-from PySide6.QtCore import Qt, QSize, QRect
-from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QBrush, QPen
+from PySide6.QtCore import Qt, QDateTime, QThread
+from PySide6.QtGui import QPixmap, QImage, QPalette, QColor
+
+from datetime import datetime
 
 from .video_thread import VideoThread
-import numpy as np
-
-
-# ---- simple ToggleSwitch based on QCheckBox ----
-class ToggleSwitch(QCheckBox):
-    def __init__(self, label=""):
-        super().__init__(label)
-        self.setChecked(True)
-        self.setStyleSheet("""
-        QCheckBox::indicator { width: 40px; height: 20px; }
-        QCheckBox::indicator:unchecked {
-            border-radius: 10px;
-            background-color: #CBD5E1;
-        }
-        QCheckBox::indicator:checked {
-            border-radius: 10px;
-            background-color: #3B82F6;
-        }
-        """)
-        self.setText("Gefäße")  # label right of the switch
-
-
-# ---- reusable UI pieces ----
-class Header(QFrame):
-    def __init__(self, icon: str, title: str, right_widget=None):
-        super().__init__()
-        self.setObjectName("Header")
-        lay = QHBoxLayout(self); lay.setContentsMargins(12, 10, 12, 6); lay.setSpacing(8)
-
-        icon_label = QLabel()
-        if icon.lower().endswith((".png", ".jpg", ".jpeg", ".svg")):
-            pixmap = QPixmap(icon).scaled(24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            icon_label.setPixmap(pixmap)
-        else:
-            icon_label.setText(icon)  # fallback: emoji
-        icon_label.setFixedWidth(28)
-
-        text = QLabel(title); text.setObjectName("HeaderTitle")
-        lay.addWidget(icon_label); lay.addWidget(text, 1)
-
-        if right_widget is not None:
-            lay.addWidget(right_widget, 0, Qt.AlignRight)
-
-
-
-
-class Switch(QCheckBox):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setChecked(True)
-        self.setText("")   # keine interne beschriftung
-
-    def sizeHint(self):
-        return QSize(40, 20)
-
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-
-        rect = e.rect()
-        bg_color = QColor("#3B82F6") if self.isChecked() else QColor("#CBD5E1")
-
-        # Hintergrund
-        p.setBrush(QBrush(bg_color))
-        p.setPen(Qt.NoPen)
-        p.drawRoundedRect(rect.adjusted(0, 0, -1, -1), rect.height()/2, rect.height()/2)
-
-        # Knopf
-        knob_d = rect.height()-4
-        x = rect.right()-knob_d-2 if self.isChecked() else rect.left()+2
-        knob_rect = QRect(x, rect.top()+2, knob_d, knob_d)
-        p.setBrush(QBrush(QColor("#FFF")))
-        p.setPen(QPen(QColor("#E5E7EB")))
-        p.drawEllipse(knob_rect)
-        p.end()
-
-class TopBar(QFrame):
-    def __init__(self):
-        super().__init__()
-        self.setObjectName("TopBar")
-        lay = QHBoxLayout(self); lay.setContentsMargins(12, 8, 12, 8); lay.setSpacing(16)
-
-        # --- left side ---
-        left = QHBoxLayout(); left.setSpacing(8)
-        icon = QLabel("🎥")
-        title = QLabel("Intraop-Assistenz · Blase")
-        title.setObjectName("TopTitle")
-        badge = QLabel("Demo")
-        badge.setObjectName("Badge")
-        left.addWidget(icon)
-        left.addWidget(title)
-        left.addWidget(badge)
-
-        left_wrap = QWidget(); left_wrap.setLayout(left)
-        lay.addWidget(left_wrap, 0, Qt.AlignLeft)
-
-        # --- right side ---
-        right = QHBoxLayout(); right.setSpacing(12)
-        patient = QLabel("Patient: ID-042"); patient.setObjectName("Pill")
-        record = QLabel("Aufnahme läuft"); record.setObjectName("Pill")
-        screenshot = QPushButton("Screenshot"); screenshot.setObjectName("TopBtn")
-        right.addWidget(patient); right.addWidget(record); right.addWidget(screenshot)
-
-        right_wrap = QWidget(); right_wrap.setLayout(right)
-        lay.addWidget(right_wrap, 0, Qt.AlignRight)
-
-
-class Card(QFrame):
-    def __init__(self, icon: str, title: str, right_widget=None):
-        super().__init__()
-        self.setObjectName("Card")
-        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
-        self.header = Header(icon, title, right_widget)
-        self.body = QFrame(); self.body.setObjectName("CardBody")
-        inner = QVBoxLayout(self.body); inner.setContentsMargins(16, 12, 16, 16); inner.setSpacing(10)
-        self.inner_layout = inner
-        outer.addWidget(self.header); outer.addWidget(self.body, 1)
-
+from .widgets import Card, TopBar, Switch, CircularProgress, VideoCanvas
+from .style import STYLE
+from .colors import COLORS
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        central = QWidget();
-        self.setCentralWidget(central)
-        outer = QVBoxLayout(central);
-        outer.setContentsMargins(0, 0, 0, 0);
-        outer.setSpacing(8)
+        self.setStyleSheet(STYLE)
+        central = QWidget(); self.setCentralWidget(central)
+        outer = QVBoxLayout(central); outer.setContentsMargins(0,0,0,0); outer.setSpacing(8)
+        self.setWindowTitle("Intraoperative Assistenz - Harnblase")
+        self._note_counter = 1
 
-        # Top bar
+        # Top Bar
         self.topbar = TopBar()
         outer.addWidget(self.topbar, 0)
 
-        # Main content row
-        root = QHBoxLayout();
-        root.setContentsMargins(16, 16, 16, 16);
-        root.setSpacing(16)
+        # Main Row
+        root = QHBoxLayout(); root.setContentsMargins(16,16,16,16); root.setSpacing(16)
         outer.addLayout(root, 1)
-        self._apply_styles()
-        self.setWindowTitle("Intraoperative Assistenz - Harnblase")
 
-        # ===== Left column =====
-        left_col = QVBoxLayout(); left_col.setSpacing(16)
+        # Left column
+        left_col = QVBoxLayout(); left_col.setSpacing(16); left_col.setContentsMargins(0, 0, 0, 0)
 
-        # rechts oben im Header: eye-icon + "Gefäße" + toggle
+        # Live Endoskopie
         toggle_row = QWidget()
-        toggle_layout = QHBoxLayout(toggle_row)
-        toggle_layout.setContentsMargins(0, 0, 0, 0)
-        toggle_layout.setSpacing(6)
-
-        eye_label = QLabel()
-        eye_pix = QPixmap("src/gui/icons/eye.png").scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        eye_label.setPixmap(eye_pix)
-
+        toggle_layout = QHBoxLayout(toggle_row); toggle_layout.setContentsMargins(0,0,0,0); toggle_layout.setSpacing(6)
+        eye_icon = QLabel()
+        pix = QPixmap("src/gui/icons/eye.png")
+        if not pix.isNull():
+            eye_icon.setPixmap(pix.scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            eye_icon.setText("👁")
         text_label = QLabel("Gefäße")
-
+        text_label.setObjectName("MutedLabel")
         self.vessel_toggle = Switch()
-
-        toggle_layout.addWidget(eye_label)
-        toggle_layout.addWidget(text_label)
-        toggle_layout.addWidget(self.vessel_toggle)
+        toggle_layout.addWidget(eye_icon); toggle_layout.addWidget(text_label); toggle_layout.addWidget(self.vessel_toggle)
 
         video_card = Card("src/gui/icons/video.png", "Live-Endoskopie", right_widget=toggle_row)
 
-        self.video_label = QLabel("Kein Video")
+        # --- Video area with interactive ROI ---
+        self.video_label = VideoCanvas()
         self.video_label.setObjectName("VideoArea")
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video_label.setMinimumSize(640, 360)
+        video_card.inner_layout.addWidget(self.video_label, 1)
 
-        # Start Video Thread
-        self.vthread = VideoThread(src=1, width=1280, height=720)
-        # after creating self.vthread
-        self.vthread.connection_changed.connect(self.set_connection_status)
-
+        # Start video thread
+        self.vthread = VideoThread(src=1, width=1280, height=720, target_fps=30)
         self.vthread.frame_ready.connect(self.update_video_frame)
-        self.vthread.start()
+        self.vthread.connection_changed.connect(self.set_connection_status)
+        try:
+            prio = QThread.HighPriority
+        except AttributeError:
+            prio = QThread.Priority.HighPriority
 
-        self.record = QLabel("Aufnahme läuft")
-        self.record.setObjectName("RecordPill")
-        self.record.setProperty("connected", False)
+        self.vthread.start(prio)
 
-        # Slider + ROI + Kommentar (unter dem Video)
-        self.overlay_slider = QSlider(Qt.Horizontal)
-        self.overlay_slider.setObjectName("Slider")
+        # Slider + ROI + Kommentar
+        self.overlay_slider = QSlider(Qt.Horizontal);
         self.overlay_slider.setValue(70)
         slider_row = QHBoxLayout()
-        slider_row.addWidget(QLabel("Transparenz Overlay"))
+        trans_label = QLabel(" Transparenz")
+        trans_label.setObjectName("MutedLabel")
+        slider_row.addWidget(trans_label)
         slider_row.addWidget(self.overlay_slider)
 
-        roi_row_left = QHBoxLayout()
-        self.roi_btn_left = QPushButton("ROI markieren")
-        self.roi_btn_left.setObjectName("PrimaryBtn")
-        self.comment_left = QLineEdit()
-        self.comment_left.setPlaceholderText("Kommentar zum Endoskopie-Bild …")
-        roi_row_left.addWidget(self.roi_btn_left, 0)
-        roi_row_left.addWidget(self.comment_left, 1)
+        roi_row = QHBoxLayout()
 
-        video_card.inner_layout.addWidget(self.video_label, 1)
+        self.roi_btn = QPushButton("ROI markieren")
+        self.roi_btn.setObjectName("ROIButton")
+        self.roi_btn.setCheckable(True)
+        self.roi_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.comment = QLineEdit()
+        self.comment.setPlaceholderText("Kommentar …")
+        self.comment.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.comment.setMinimumWidth(0)
+        pal = self.comment.palette()
+        pal.setColor(QPalette.PlaceholderText, QColor(*COLORS["light_gray"]))
+        pal.setColor(QPalette.Text, QColor(*COLORS["gray"]))
+        self.comment.setPalette(pal)
+
+        video_card.inner_layout.addWidget(self.roi_btn, 0, Qt.AlignLeft)
+        video_card.inner_layout.addWidget(self.comment, 1)
+
+        # make placeholder + typed text gray
+        pal = self.comment.palette()
+        pal.setColor(QPalette.PlaceholderText, QColor(*COLORS["light_gray"]))  # softer gray for placeholder
+        pal.setColor(QPalette.Text, QColor(*COLORS["gray"]))  # typed text gray
+        self.comment.setPalette(pal)
+
+        roi_row.addWidget(self.roi_btn, 0); roi_row.addWidget(self.comment, 1)
+
+        # connect ROI logic
+        self.roi_btn.toggled.connect(self.on_roi_toggled)
+        self.video_label.roi_marked.connect(self.on_roi_marked)
+
         video_card.inner_layout.addLayout(slider_row)
-        video_card.inner_layout.addLayout(roi_row_left)
+        video_card.inner_layout.addLayout(roi_row)
 
-        # --- Abdeckung (links) ---
-        cov_card = Card("📊", "Abdeckung")
-        self.cov_bar = QProgressBar();
-        self.cov_bar.setValue(68)
-        cov_card.inner_layout.addWidget(self.cov_bar)
+        # Abdeckung
+        cov_card = Card("src/gui/icons/ratio.png", "Abdeckung")
+        self.circ_cov = CircularProgress(68)
+        cov_card.inner_layout.addWidget(self.circ_cov, alignment=Qt.AlignCenter)
 
-        # --- Gewebe-Score (rechts) ---
-        score_card = Card("🧬", "Gewebe-Score")
+        # Gewebe Score
+        score_card = Card("src/gui/icons/graph.png", "Gewebe-Score")
         score_grid = QGridLayout()
-        score_grid.addWidget(QLabel("Gesund:"), 0, 0);
-        score_grid.addWidget(QLabel("78 %"), 0, 1)
-        score_grid.addWidget(QLabel("Verdächtig:"), 1, 0);
-        score_grid.addWidget(QLabel("19 %"), 1, 1)
-        score_grid.addWidget(QLabel("Tumorverdacht:"), 2, 0);
-        score_grid.addWidget(QLabel("3 %"), 2, 1)
+        score_grid.addWidget(QLabel("Gesund:"), 0, 0);  score_grid.addWidget(QLabel("78 %"), 0, 1)
+        score_grid.addWidget(QLabel("Verdächtig:"), 1, 0); score_grid.addWidget(QLabel("19 %"), 1, 1)
+        score_grid.addWidget(QLabel("Tumorverdacht:"), 2, 0); score_grid.addWidget(QLabel("3 %"), 2, 1)
         score_card.inner_layout.addLayout(score_grid)
 
-        # --- nebeneinander anordnen ---
-        row_widget = QWidget()
-        row_layout = QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(0, 0, 0, 0);
-        row_layout.setSpacing(16)
-        row_layout.addWidget(cov_card, 1)
-        row_layout.addWidget(score_card, 1)
+        # --- Notizen panel ---
+        notes_card = Card("src/gui/icons/note.png", "Notizen")
+        self.notes_view = QPlainTextEdit()
+        self.notes_view.setObjectName("NotesView")
+        self.notes_view.setReadOnly(True)
+        self.notes_view.setFrameShape(QFrame.NoFrame)
+        self.notes_view.setPlaceholderText("Noch keine Notizen.")
+        notes_card.inner_layout.addWidget(self.notes_view)
 
+        # Add left side
         left_col.addWidget(video_card, 3)
-        left_col.addWidget(row_widget, 1)
+        row = QWidget(); row_layout = QHBoxLayout(row); row_layout.setContentsMargins(0,0,0,0); row_layout.setSpacing(16)
+        row_layout.addWidget(cov_card, 1); row_layout.addWidget(score_card, 1)
+        left_col.addWidget(row, 1)
+        left_col.addWidget(notes_card, 1)
 
-        # ===== Right column: Modell über volle Höhe =====
+        left_wrap = QWidget(); left_wrap.setLayout(left_col)
+
+        # Right column
         model_card = Card("src/gui/icons/Bladder.png", "Digitales Blasenmodell")
         self.model_area = QLabel("3D-Modell (Platzhalter)")
         self.model_area.setObjectName("ModelArea")
         self.model_area.setAlignment(Qt.AlignCenter)
-        self.model_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         model_card.inner_layout.addWidget(self.model_area, 1)
 
-        # ===== assemble =====
-        left_wrap = QWidget(); left_wrap.setLayout(left_col)
         root.addWidget(left_wrap, 2)
         root.addWidget(model_card, 3)
 
-    def set_connection_status(self, connected: bool):
-        if connected:
-            self.record.setProperty("connected", True)
-            self.record.setStyleSheet(self.styleSheet())  # force reapply
-        else:
-            self.record.setProperty("connected", False)
-            self.record.setStyleSheet(self.styleSheet())
-    # --- Video frame update ---
-    def update_video_frame(self, rgb):
-        # mark camera as connected
-        if not self.record.property("connected"):
-            self.record.setProperty("connected", True)
-            self.record.setStyleSheet(self.styleSheet())  # reapply CSS
+        # --- Footer (Copyright) ---
+        self.footer = QStatusBar(self)
+        self.footer.setObjectName("Footer")
+        self.footer.setSizeGripEnabled(False)
 
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(qimg))
+        # one container item so QStatusBar doesn't draw separators
+        footer_container = QWidget(self.footer)
+        hl = QHBoxLayout(footer_container)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+
+        footer_label = QLabel(f"© Franziska Krauß 2025", footer_container)
+        footer_label.setObjectName("FooterLabel")
+        footer_label.setAlignment(Qt.AlignCenter)
+
+        hl.addStretch(1)
+        hl.addWidget(footer_label, 0)
+        hl.addStretch(1)
+
+        # only ONE permanent widget → no separators
+        self.footer.clearMessage()
+        self.footer.addPermanentWidget(footer_container, 1)
+        self.setStatusBar(self.footer)
+
+    # video frame (receives QImage)
+    def update_video_frame(self, qimg: QImage):
+        """
+        Receive and display new video frame.
+        Also detect an all-black frame (video stopped) and set RecordPill[stopped=true].
+        """
+        # show frame in the VideoCanvas (existing behavior)
+        self.video_label.set_frame(qimg)
+
+        # --- detect black/blank frame (simple, fast heuristic) ---
+        is_black = True
+        BLACK_THR = 12  # 0..255, increase to be less strict
+
+        if qimg is None or qimg.isNull():
+            is_black = True
+        else:
+            w, h = qimg.width(), qimg.height()
+            if w == 0 or h == 0:
+                is_black = True
+            else:
+                # sample center and 4 offsets (small cross) to be a bit robust
+                sample_coords = [
+                    (w // 2, h // 2),
+                    (w // 4, h // 2),
+                    (3 * w // 4, h // 2),
+                    (w // 2, h // 4),
+                    (w // 2, 3 * h // 4)
+                ]
+                # if any sample is bright enough, treat frame as not-black
+                for (sx, sy) in sample_coords:
+                    try:
+                        col = qimg.pixelColor(int(sx), int(sy))
+                    except Exception:
+                        # fallback: assume not-black if sampling fails
+                        is_black = False
+                        break
+
+                    if (col.red() > BLACK_THR) or (col.green() > BLACK_THR) or (col.blue() > BLACK_THR):
+                        is_black = False
+                        break
+                else:
+                    # loop finished without breaking → still black
+                    is_black = True
+
+        # --- set CSS property on record pill and refresh style ---
+        try:
+            pill = self.topbar.record_wrap
+            pill.setProperty("stopped", bool(is_black))
+            # keep existing connected property unchanged (so CSS for connected still works)
+            pill.style().unpolish(pill)
+            pill.style().polish(pill)
+            pill.update()
+        except Exception:
+            # don't break the video display if topbar isn't available yet
+            pass
+
+    # camera connected status → flip pill color
+    def set_connection_status(self, connected: bool):
+        pill = self.topbar.record_wrap
+        pill.setProperty("connected", connected)
+        pill.style().unpolish(pill)
+        pill.style().polish(pill)
+        pill.update()
+
+    # ROI button behavior
+    def on_roi_toggled(self, checked: bool):
+        if checked:
+            ok = self.video_label.begin_annotation(self._note_counter)
+            if not ok:
+                self.roi_btn.setChecked(False)
+        else:
+            self.video_label.cancel_annotation()
+
+    # When a ROI is marked in the video
+    def on_roi_marked(self, label_num: int):
+        t = QDateTime.currentDateTime().toString("yyyy.MM.dd HH:mm")
+        text = self.comment.text().strip() or "Auffälligkeit"
+        line = f"#{label_num} {t} – {text}"
+        self.notes_view.appendPlainText(line)
+        self._note_counter = label_num + 1
+        self.roi_btn.setChecked(False)
+        self.comment.clear()
 
     def closeEvent(self, event):
         if hasattr(self, "vthread"):
             self.vthread.stop()
             self.vthread.wait(500)
         super().closeEvent(event)
-
-    def _apply_styles(self):
-        self.setStyleSheet("""
-        QMainWindow { background: #F7F9FC; }
-        #Card {
-            background: #FFFFFF; border: 1px solid #E6EAF0; border-radius: 12px;
-        }
-        #Header { background: #FFFFFF; border-bottom: 1px solid #EEF2F7;
-                  border-top-left-radius: 12px; border-top-right-radius: 12px; }
-        #HeaderIcon { font-size: 18px; }
-        #HeaderTitle { font-weight: 600; font-size: 16px; color: #0F172A; }
-        QLabel { color: #111827; }
-        #VideoArea, #ModelArea {
-            background: #F1F5F9; border: 1px dashed #D8DEE9; border-radius: 10px; 
-            color: #64748B; min-height: 260px;
-        }
-        QProgressBar { border: 1px solid #E5E7EB; border-radius: 8px; background: #EEF2F7; height: 18px; }
-        QProgressBar::chunk { background-color: #3B82F6; border-radius: 8px; }
-        #PrimaryBtn { background: #111827; color: white; padding: 8px 12px; border-radius: 10px; border: none; }
-        #PrimaryBtn:hover { background: #0F172A; }
-        QSlider::groove:horizontal { height: 6px; background: #E5E7EB; border-radius: 3px; }
-        QSlider::handle:horizontal { background: #111827; width: 16px; height:16px; margin: -6px 0; border-radius: 8px; }
-        QLineEdit { padding: 8px 10px; border: 1px solid #E5E7EB; border-radius: 8px; background: #FFFFFF; }
-        #TopBar {
-    background: #FFFFFF;
-    border-bottom: 1px solid #E5E7EB;
-}
-#TopTitle {
-    font-size: 18px;
-    font-weight: 600;
-    color: #111827;
-}
-#Badge {
-    background: #E0F2FE;
-    color: #0369A1;
-    padding: 2px 8px;
-    border-radius: 12px;
-    font-size: 12px;
-}
-#Pill {
-    background: #111827;
-    color: white;
-    padding: 2px 10px;
-    border-radius: 999px;
-    font-size: 12px;
-}
-#TopBtn {
-    background: #F9FAFB;
-    border: 1px solid #D1D5DB;
-    border-radius: 8px;
-    padding: 4px 8px;
-}
-#Pill {
-    border-radius: 999px;       /* fully round */
-    padding: 4px 12px;
-    font-size: 12px;
-    font-weight: 500;
-}
-#RecordPill {
-    border-radius: 999px;
-    padding: 4px 12px;
-    font-size: 12px;
-    font-weight: 500;
-    background: #111827;   /* default black */
-    color: white;
-}
-#RecordPill[connected="true"] {
-    background: #3B82F6;   /* blue when connected */
-    color: white;
-}
-
-
-
-#TopBtn:hover { background: #F3F4F6; }
-
-        """)
