@@ -2,11 +2,18 @@ from PySide6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox,
     QSizePolicy
 )
+from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import Signal, Qt, QPoint, QRect
+from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QFont
+
 from PySide6.QtCore import Qt, QSize, QRect, QPointF, Signal
-from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush, QPen, QIcon
+from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush, QPen, QIcon, QImage
 import math
 
 from .colors import rgb, COLORS
+
+
+from .colors import COLORS
 
 # ---- Circular Progress for Abdeckung ----
 class CircularProgress(QWidget):
@@ -218,177 +225,102 @@ class TopBar(QFrame):
         self.camera_label.style().unpolish(self.camera_label)
         self.camera_label.style().polish(self.camera_label)
 
-
-
-# ... keep your imports ...
-from PySide6.QtCore import Qt, QSize, QRect, QPointF, Signal
-from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush, QPen, QFont
-import math
-
-from .colors import COLORS
-
-# ... keep your imports ...
-from PySide6.QtCore import Qt, QSize, QRect, QPointF, Signal
-from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush, QPen, QFont
-import math
-
-from .colors import COLORS
+# widgets_video_canvas.py (copy into your widgets module or replace existing VideoCanvas)
+from PySide6.QtWidgets import QLabel
+from PySide6.QtCore import Signal, Qt, QRect
+from PySide6.QtGui import QPixmap, QImage
+import typing
 
 class VideoCanvas(QLabel):
-    # now emits also the note number (label_num)
-    roi_marked = Signal(int)  # x, y (image px), label_num
+    """
+    Minimal video display widget that supports:
+      - set_frame(QImage) : show base frame
+      - set_overlay(QImage) : set RGBA overlay (scaled to frame)
+      - clear_overlay()
+      - set_overlay_opacity(float)
+      - begin_annotation / cancel_annotation stubs and roi_marked signal
+    """
+    roi_marked = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._base_qimg: typing.Optional[QImage] = None
+        self._overlay_qimg: typing.Optional[QImage] = None
+        self._overlay_opacity: float = 0.7
         self.setAlignment(Qt.AlignCenter)
-        self.setText("Kein Video")
-        self._qimg = None              # last QImage
-        self._img_size = None          # (w, h)
-        self._target_rect = QRect()    # where the image is drawn inside label
-        self._annotations = []         # [{pt_img: QPointF, label: int}]
-        self._annotate_active = False
-        self._pending_label = None     # int or None
+        self._next_roi_label = 1
+        # make widget scale contents but preserve aspect ratio
+        self.setScaledContents(False)
 
-    # ---------- public API ----------
-    def set_frame(self, qimg):
-        self._qimg = qimg
-        self._img_size = (qimg.width(), qimg.height())
-        self._update_pixmap()
+    def set_frame(self, qimg: QImage):
+        """Display a frame (QImage). If overlay exists and opacity > 0, show composited version."""
+        if qimg is None:
+            return
+        self._base_qimg = qimg
+        # if overlay and toggle is handled externally, caller will pass composited QImage already.
+        # If overlay exists in this widget, composite here:
+        if self._overlay_qimg is not None:
+            # composite using QPainter
+            base = self._base_qimg.convertToFormat(QImage.Format.Format_RGBA8888)
+            ov = self._overlay_qimg
+            if ov.format() != QImage.Format.Format_RGBA8888:
+                ov = ov.convertToFormat(QImage.Format.Format_RGBA8888)
+            if ov.size() != base.size():
+                ov = ov.scaled(base.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
 
-    def begin_annotation(self, label_num: int) -> bool:
-        """Enable one-shot annotation mode and set the label for the next mark."""
-        if self._qimg is None:
-            return False
-        self._annotate_active = True
-        self._pending_label = int(label_num)
-        self.setCursor(Qt.CrossCursor)
+            # draw overlay on base
+            from PySide6.QtGui import QPainter
+            res = base.copy()
+            painter = QPainter(res)
+            painter.setOpacity(self._overlay_opacity)
+            painter.drawImage(0, 0, ov)
+            painter.end()
+            out = res.convertToFormat(QImage.Format.Format_RGB888)
+        else:
+            # show base directly
+            out = self._base_qimg.convertToFormat(QImage.Format.Format_RGB888)
+
+        pix = QPixmap.fromImage(out)
+        self.setPixmap(pix)
+
+    def set_overlay(self, overlay_qimg: QImage):
+        """Set an RGBA overlay image (QImage). We'll composite it onto future frames."""
+        if overlay_qimg is None:
+            self._overlay_qimg = None
+        else:
+            if overlay_qimg.format() != QImage.Format.Format_RGBA8888:
+                try:
+                    overlay_qimg = overlay_qimg.convertToFormat(QImage.Format.Format_RGBA8888)
+                except Exception:
+                    pass
+            self._overlay_qimg = overlay_qimg
+
+    def clear_overlay(self):
+        self._overlay_qimg = None
+        # refresh display
+        if self._base_qimg is not None:
+            self.set_frame(self._base_qimg)
+
+    def set_overlay_opacity(self, opacity: float):
+        self._overlay_opacity = max(0.0, min(1.0, float(opacity)))
+        if self._base_qimg is not None:
+            self.set_frame(self._base_qimg)
+
+    # --- ROI stubs (expand as needed) ---
+    def begin_annotation(self, label_num: int):
+        # In a full implementation you'd enter mouse-capture mode; here just return True
         return True
 
     def cancel_annotation(self):
-        self._annotate_active = False
-        self._pending_label = None
-        self.unsetCursor()
-        self._update_pixmap()
+        return True
 
-    # ---------- events / drawing ----------
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self._update_pixmap()
+    # Example to emit roi_marked (call when annotation finished in a real implementation)
+    def _emit_roi_marked(self):
+        self.roi_marked.emit(self._next_roi_label)
+        self._next_roi_label += 1
 
-    def mousePressEvent(self, e):
-        # single-click to drop an X
-        if not self._annotate_active or e.button() != Qt.LeftButton:
-            return super().mousePressEvent(e)
-        if not self._target_rect.contains(e.pos()):
-            self.cancel_annotation()
-            return
 
-        # label coords -> image coords
-        pt_img = self._label_to_img(QPointF(e.position()))
-        if pt_img is None:
-            self.cancel_annotation()
-            return
 
-        label_num = int(self._pending_label) if self._pending_label is not None else 0
-        self._annotations.append({"pt_img": pt_img, "label": label_num})
-        self._update_pixmap()
-
-        # emit and exit one-shot mode
-        self.roi_marked.emit(label_num)
-        self.cancel_annotation()
-
-    def _update_pixmap(self):
-        if self._qimg is None or self.width() <= 0 or self.height() <= 0:
-            return
-
-        base = QPixmap.fromImage(self._qimg)
-        scaled = base.scaled(self.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
-        x_off = (self.width() - scaled.width()) // 2
-        y_off = (self.height() - scaled.height()) // 2
-        self._target_rect = QRect(x_off, y_off, scaled.width(), scaled.height())
-
-        composed = QPixmap(self.size())
-        composed.fill(Qt.transparent)
-        p = QPainter(composed)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.drawPixmap(self._target_rect.topLeft(), scaled)
-
-        # draw all stored X markers + labels
-        for ann in self._annotations:
-            pt_lbl = self._img_to_label(ann["pt_img"])
-            self._draw_marker_x_with_label(
-                p, pt_lbl, label_text=str(ann.get("label", "")),
-                x_size=16, line_width=3,
-                x_color=QColor(*COLORS["light_blue"]),
-                text_color=QColor(*COLORS["gray"])
-            )
-
-        p.end()
-        self.setPixmap(composed)
-
-    # ----- helpers -----
-    def _img_to_label(self, pt_img: QPointF) -> QPointF:
-        if self._img_size is None or self._target_rect.isNull():
-            return QPointF(0, 0)
-        iw, ih = self._img_size
-        tr = self._target_rect
-        scale = min(tr.width() / iw, tr.height() / ih) if iw and ih else 1.0
-        x = tr.left() + pt_img.x() * scale
-        y = tr.top()  + pt_img.y() * scale
-        return QPointF(x, y)
-
-    def _label_to_img(self, pt_label: QPointF):
-        if self._img_size is None or self._target_rect.isNull():
-            return None
-        iw, ih = self._img_size
-        tr = self._target_rect
-        if not tr.contains(pt_label.toPoint()):
-            return None
-        scale = min(tr.width() / iw, tr.height() / ih) if iw and ih else 1.0
-        x = (pt_label.x() - tr.left()) / scale
-        y = (pt_label.y() - tr.top())  / scale
-        x = max(0.0, min(float(iw - 1), x))
-        y = max(0.0, min(float(ih - 1), y))
-        return QPointF(x, y)
-
-    def _draw_marker_x_with_label(self, painter: QPainter, center_label_pt: QPointF,
-                                  label_text: str, x_size: int = 8, line_width: int = 3,
-                                  x_color: QColor = QColor(0, 190, 255), text_color: QColor = QColor(62, 68, 76)):
-        """Draw an 'X' centered at center_label_pt with small label text next to it."""
-        cx, cy = center_label_pt.x(), center_label_pt.y()
-        half = x_size / 2.0
-
-        pen = QPen(x_color, line_width, Qt.SolidLine, Qt.RoundCap)
-        painter.setPen(pen)
-        painter.setBrush(Qt.NoBrush)
-        # two diagonals
-        painter.drawLine(QPointF(cx - half, cy - half), QPointF(cx + half, cy + half))
-        painter.drawLine(QPointF(cx - half, cy + half), QPointF(cx + half, cy - half))
-
-        # label box (subtle white bg for readability)
-        if label_text:
-            fm = painter.fontMetrics()
-            # small, bold-ish font
-            font = painter.font()
-            font.setPointSize(10)
-            font.setBold(True)
-            painter.setFont(font)
-            text_w = fm.horizontalAdvance(label_text) + 8
-            text_h = fm.height() + 4
-
-            # place slightly to the right-top of the X
-            tx = cx + half + 6
-            ty = cy - half - 6
-
-            # background bubble
-            bg_rect = QRect(int(tx), int(ty - text_h + fm.ascent()), int(text_w), int(text_h))
-            painter.setPen(QPen(QColor(*COLORS["light_gray"])))
-            painter.setBrush(QBrush(QColor(*COLORS["white"])))
-            painter.drawRoundedRect(bg_rect, 6, 6)
-
-            # text
-            painter.setPen(QPen(text_color))
-            painter.drawText(bg_rect, Qt.AlignCenter, label_text)
 
 
 # ---- Circular Progress for Abdeckung ----

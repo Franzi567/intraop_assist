@@ -4,11 +4,16 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="16233c14-ebe6-49b9-97cb-9dafb9403a56" name="Changes" comment="Works for now.">
-      <change afterPath="$PROJECT_DIR$/src/gui/colors.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/gui/style.py" afterDir="false" />
+    <list default="true" id="16233c14-ebe6-49b9-97cb-9dafb9403a56" name="Changes" comment="Frontend works fine!">
+      <change afterPath="$PROJECT_DIR$/server/test_load.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/gui/VideoCanvas.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/gui/model_worker.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/gui/main_window.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/gui/main_window.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/gui/minimal_cam_gui.py" beforeDir="false" afterPath="$PROJECT_DIR$/backup/minimal_cam_gui.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/gui/model_panel.py" beforeDir="false" afterPath="$PROJECT_DIR$/.env" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/gui/sidebar_panel.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/gui/video_panel.py" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/src/gui/video_thread.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/gui/video_thread.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/gui/widgets.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/gui/widgets.py" afterDir="false" />
     </list>
@@ -27,21 +32,21 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
-  "lastFilter": {
-    "state": "OPEN",
-    "assignee": "Franzi567"
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;Franzi567&quot;
   }
-}]]></component>
-  <component name="GithubPullRequestsUISettings"><![CDATA[{
-  "selectedUrlAndAccountId": {
-    "url": "https://github.com/Franzi567/intraop_assist.git",
-    "accountId": "23372de8-41a4-45df-bebd-169c448b93e0"
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/Franzi567/intraop_assist.git&quot;,
+    &quot;accountId&quot;: &quot;23372de8-41a4-45df-bebd-169c448b93e0&quot;
   }
-}]]></component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 4
-}]]></component>
+}</component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 4
+}</component>
   <component name="ProjectId" id="31pIBHMZh4nK7DlBJ8v9h9DBPhK" />
   <component name="ProjectLevelVcsManager" settingsEditedManually="true" />
   <component name="ProjectViewState">
@@ -52,9 +57,11 @@
   "keyToString": {
     "Python.app.executor": "Run",
     "Python.main_window.executor": "Run",
+    "Python.test_load.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "SHARE_PROJECT_CONFIGURATION_FILES": "true",
     "git-widget-placeholder": "master",
+    "last_opened_file_path": "C:/Git/intraop_assist/server/models/checkpoints",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
     "node.js.selected.package.eslint": "(autodetect)",
@@ -64,9 +71,43 @@
   }
 }]]></component>
   <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="C:\Git\intraop_assist\server\models\checkpoints" />
+    </key>
     <key name="MoveFile.RECENT_KEYS">
+      <recent name="C:\Git\intraop_assist\backup" />
       <recent name="C:\Git\intraop_assist\src\gui\icons" />
     </key>
+  </component>
+  <component name="RunManager">
+    <configuration name="test_load" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="intraop_assist" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/server" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/server/test_load.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <recent_temporary>
+      <list>
+        <item itemvalue="Python.test_load" />
+      </list>
+    </recent_temporary>
   </component>
   <component name="SharedIndexes">
     <attachedChunks>
@@ -84,7 +125,8 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1756214449916</updated>
-      <workItem from="1756214451658" duration="27962000" />
+      <workItem from="1756214451658" duration="29203000" />
+      <workItem from="1756362996739" duration="24982000" />
     </task>
     <task id="LOCAL-00001" summary="First setup of main window with camera.">
       <option name="closed" value="true" />
@@ -102,7 +144,15 @@
       <option name="project" value="LOCAL" />
       <updated>1756222150769</updated>
     </task>
-    <option name="localTasksCounter" value="3" />
+    <task id="LOCAL-00003" summary="Frontend works fine!">
+      <option name="closed" value="true" />
+      <created>1756306906280</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1756306906280</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -111,14 +161,15 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="First setup of main window with camera." />
     <MESSAGE value="Works for now." />
-    <option name="LAST_COMMIT_MESSAGE" value="Works for now." />
+    <MESSAGE value="Frontend works fine!" />
+    <option name="LAST_COMMIT_MESSAGE" value="Frontend works fine!" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/gui/style.py</url>
-          <line>149</line>
+          <line>151</line>
           <option name="timeStamp" value="4" />
         </line-breakpoint>
       </breakpoints>
@@ -126,6 +177,7 @@
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/intraop_assist$main_window.coverage" NAME="main_window Coverage Results" MODIFIED="1756220547465" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/gui" />
+    <SUITE FILE_PATH="coverage/intraop_assist$test_load.coverage" NAME="test_load Coverage Results" MODIFIED="1756370390237" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/server" />
     <SUITE FILE_PATH="coverage/intraop_assist$app.coverage" NAME="app Coverage Results" MODIFIED="1756216504373" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/gui" />
   </component>
 </project>

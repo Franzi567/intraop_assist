@@ -1,14 +1,16 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
     QLabel, QPushButton, QSlider, QLineEdit, QPlainTextEdit,
-    QStatusBar, QFrame, QSizePolicy
+    QStatusBar, QFrame, QSizePolicy, QFileDialog
 )
 from PySide6.QtCore import Qt, QDateTime, QThread
 from PySide6.QtGui import QPixmap, QImage, QPalette, QColor
 
 from datetime import datetime
+import os
 
 from .video_thread import VideoThread
+
 from .widgets import Card, TopBar, Switch, CircularProgress, VideoCanvas
 from .style import STYLE
 from .colors import COLORS
@@ -21,6 +23,7 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(central); outer.setContentsMargins(0,0,0,0); outer.setSpacing(8)
         self.setWindowTitle("Intraoperative Assistenz - Harnblase")
         self._note_counter = 1
+        self._pending_video_src = r"C:\Git\intraop_assist\data\Video_Snippet_1.mp4"
 
         # Top Bar
         self.topbar = TopBar()
@@ -55,16 +58,54 @@ class MainWindow(QMainWindow):
         self.video_label.setMinimumSize(640, 360)
         video_card.inner_layout.addWidget(self.video_label, 1)
 
-        # Start video thread
-        self.vthread = VideoThread(src=1, width=1280, height=720, target_fps=30)
-        self.vthread.frame_ready.connect(self.update_video_frame)
-        self.vthread.connection_changed.connect(self.set_connection_status)
-        try:
-            prio = QThread.HighPriority
-        except AttributeError:
-            prio = QThread.Priority.HighPriority
+        # --- Footer (Copyright) ---   <-- move this block *above* starting the video thread
+        self.footer = QStatusBar(self)
+        self.footer.setObjectName("Footer")
+        self.footer.setSizeGripEnabled(False)
+        footer_container = QWidget(self.footer)
+        hl = QHBoxLayout(footer_container)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+        footer_label = QLabel(f"© Franziska Krauß 2025", footer_container)
+        footer_label.setObjectName("FooterLabel")
+        footer_label.setAlignment(Qt.AlignCenter)
+        hl.addStretch(1);
+        hl.addWidget(footer_label, 0);
+        hl.addStretch(1)
+        self.footer.clearMessage()
+        self.footer.addPermanentWidget(footer_container, 1)
+        self.setStatusBar(self.footer)
 
-        self.vthread.start(prio)
+        # create "Open video" button (user can manually pick a file)
+        self.open_video_btn = QPushButton("Open video")
+        self.open_video_btn.setObjectName("OpenVideoButton")
+        self.open_video_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.open_video_btn.clicked.connect(self.on_open_video_clicked)
+        # place it in the video_card header or under video controls; example: add to the inner layout
+        video_card.inner_layout.addWidget(self.open_video_btn, 0, Qt.AlignRight)
+
+        # --- Model worker (HAC inference) ---
+        try:
+            from .model_worker import ModelWorker
+            self.model_worker = ModelWorker(target_fps=5, max_queue=2)
+        except Exception:
+            # fallback if import path differs; import locally then instantiate
+            from .model_worker import ModelWorker
+            self.model_worker = ModelWorker(target_fps=5, max_queue=2)
+
+        # internal storage for last frame / overlay
+        self._last_frame_qimg = None  # QImage (RGB)
+        self._last_overlay_qimg = None  # QImage (RGBA)
+
+        # connect worker signals
+        self.model_worker.overlay_ready.connect(self.on_overlay_ready)
+        self.model_worker.error.connect(lambda msg: self.footer.showMessage(msg, 5000))
+        self.model_worker.started_ok.connect(lambda: self.footer.showMessage("Model loaded", 3000))
+
+        # start worker thread
+        self.model_worker.start()
+
+        self.vessel_toggle.toggled.connect(lambda on: self._on_vessel_toggle(on))
 
         # Slider + ROI + Kommentar
         self.overlay_slider = QSlider(Qt.Horizontal);
@@ -74,7 +115,10 @@ class MainWindow(QMainWindow):
         trans_label.setObjectName("MutedLabel")
         slider_row.addWidget(trans_label)
         slider_row.addWidget(self.overlay_slider)
+        # slider controlling overlay opacity (0..1)
+        self.overlay_slider.valueChanged.connect(lambda v: self.video_label.set_overlay_opacity(v / 100.0))
 
+        self.vessel_toggle.toggled.connect(lambda on: None if on else self.video_label.clear_overlay())
         roi_row = QHBoxLayout()
 
         self.roi_btn = QPushButton("ROI markieren")
@@ -149,37 +193,194 @@ class MainWindow(QMainWindow):
         root.addWidget(left_wrap, 2)
         root.addWidget(model_card, 3)
 
-        # --- Footer (Copyright) ---
-        self.footer = QStatusBar(self)
-        self.footer.setObjectName("Footer")
-        self.footer.setSizeGripEnabled(False)
+        self.open_video_btn.clicked.connect(self.on_open_video_clicked)
 
-        # one container item so QStatusBar doesn't draw separators
-        footer_container = QWidget(self.footer)
-        hl = QHBoxLayout(footer_container)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(0)
+    def on_model_ready(self):
+        """Called when ModelWorker finished loading."""
+        self._model_ready = True
+        self.footer.showMessage("Modell geladen – starte Video…", 3000)
+        # Start the video now (using whatever source we have queued)
+        self.start_video_thread(self._pending_video_src)
 
-        footer_label = QLabel(f"© Franziska Krauß 2025", footer_container)
-        footer_label.setObjectName("FooterLabel")
-        footer_label.setAlignment(Qt.AlignCenter)
+    def on_open_video_clicked(self):
+        """Manual Open Video button handler (user-initiated)."""
+        start_dir = getattr(self, "_last_video_dir", os.getcwd())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open video file",
+            start_dir,
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm);;All files (*)"
+        )
+        if not path:
+            return
+        self._last_video_dir = os.path.dirname(path)
+        self._pending_video_src = path  # remember the choice
 
-        hl.addStretch(1)
-        hl.addWidget(footer_label, 0)
-        hl.addStretch(1)
+        if self._model_ready:
+            self.footer.showMessage(f"Opening: {os.path.basename(path)}", 3000)
+            self.start_video_thread(path)
+        else:
+            # start later when on_model_ready() fires
+            self.footer.showMessage(
+                f"Modell lädt noch – starte Video automatisch: {os.path.basename(path)}",
+                4000
+            )
 
-        # only ONE permanent widget → no separators
-        self.footer.clearMessage()
-        self.footer.addPermanentWidget(footer_container, 1)
-        self.setStatusBar(self.footer)
+    def on_frame_for_model(self, np_frame):
+        try:
+            if hasattr(self, "model_worker") and getattr(self.model_worker, "enqueue_frame", None):
+                self.model_worker.enqueue_frame(np_frame)
+        except Exception:
+            pass
+
+    def on_overlay_ready(self, overlay_qimg: QImage):
+        self._last_overlay_qimg = overlay_qimg
+        if self.vessel_toggle.isChecked():
+            self.video_label.set_overlay(overlay_qimg)
+            self.video_label.set_overlay_opacity(self.overlay_slider.value() / 100.0)
+
+    def _on_vessel_toggle(self, on: bool):
+        if not on:
+            self.video_label.clear_overlay()
+            if self._last_frame_qimg is not None:
+                self.video_label.set_frame(self._last_frame_qimg)
+        else:
+            if self._last_overlay_qimg is not None:
+                self.video_label.set_overlay(self._last_overlay_qimg)
+                self.video_label.set_overlay_opacity(self.overlay_slider.value() / 100.0)
+
+    def _compose_overlay(self, base_qimg: QImage, overlay_qimg: QImage, opacity: float) -> QImage:
+        """Scale overlay to base size and draw it with given opacity onto a copy of base_qimg."""
+        if base_qimg is None:
+            return overlay_qimg
+
+        bw, bh = base_qimg.width(), base_qimg.height()
+        ov = overlay_qimg
+        if ov.format() != QImage.Format.Format_RGBA8888:
+            try:
+                ov = ov.convertToFormat(QImage.Format.Format_RGBA8888)
+            except Exception:
+                pass
+        # scale overlay to base size
+        if ov.width() != bw or ov.height() != bh:
+            ov = ov.scaled(bw, bh, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+
+        base_rgba = base_qimg.convertToFormat(QImage.Format.Format_RGBA8888)
+        result = base_rgba.copy()
+
+        from PySide6.QtGui import QPainter
+        painter = QPainter(result)
+        painter.setOpacity(opacity)
+        painter.drawImage(0, 0, ov)
+        painter.end()
+
+        # convert to RGB for display (VideoCanvas.set_frame likely expects RGB)
+        return result.convertToFormat(QImage.Format.Format_RGB888)
+
+    def closeEvent(self, event):
+        try:
+            # stop model worker
+            if hasattr(self, "model_worker") and self.model_worker is not None:
+                try:
+                    self.model_worker.stop()
+                    self.model_worker.wait(3000)
+                except Exception:
+                    pass
+
+            # stop video thread
+            if hasattr(self, "vthread") and self.vthread is not None:
+                try:
+                    self.vthread.stop()
+                    self.vthread.wait(3000)
+                except Exception:
+                    pass
+        finally:
+            super().closeEvent(event)
+
+    def start_video_thread(self, src="auto"):
+        """
+        Stop any existing thread and start a new VideoThread for `src`.
+        If src == "auto", and the thread emits the specific 'no camera' error,
+        we will automatically open a file dialog so the user can pick a video file.
+        """
+        # stop existing thread cleanly
+        if hasattr(self, "vthread") and self.vthread is not None:
+            try:
+                self.vthread.stop()
+                self.vthread.wait(500)
+            except Exception:
+                pass
+
+        # create thread and connect signals
+        self.vthread = VideoThread(src=src, width=1280, height=720, target_fps=22.74, loop_video=True)
+        self.vthread.frame_ready.connect(self.update_video_frame)
+        self.vthread.frame_raw.connect(self.on_frame_for_model)
+        self.vthread.connection_changed.connect(self.set_connection_status)
+        self.vthread.video_finished.connect(lambda: self.footer.showMessage("Video finished", 3000))
+
+        # handle errors:
+        # - if starting with "auto" we want to open file picker when we get that specific error
+        def _error_handler(msg):
+            # show message in footer always
+            self.footer.showMessage(msg, 5000)
+            # if this was the 'auto' no-camera error, open file picker once
+            if isinstance(src, str) and src == "auto" and "No camera found for 'auto' source" in msg:
+                # run file picker on the UI thread immediately
+                self.on_auto_no_camera()
+
+        # connect to the thread
+        self.vthread.error.connect(_error_handler)
+
+        # also allow manual open button to work
+        self.open_video_btn.setEnabled(True)
+
+        # start with high priority if available
+        try:
+            prio = QThread.HighPriority
+        except AttributeError:
+            prio = QThread.Priority.HighPriority
+        self.vthread.start(prio)
+
+    def on_auto_no_camera(self):
+        """
+        Called automatically when src=='auto' reports no camera.
+        Show a file dialog and, if a file is chosen, restart video thread with that file.
+        """
+        # prefer last opened dir or cwd
+        start_dir = getattr(self, "_last_video_dir", os.getcwd())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "No camera found — open video file instead",
+            start_dir,
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm);;All files (*)"
+        )
+        if not path:
+            # user cancelled — nothing to do
+            return
+        # remember dir for next time
+        self._last_video_dir = os.path.dirname(path)
+        # restart thread with chosen file (non-auto)
+        self.start_video_thread(path)
+
+    def on_open_video_clicked(self):
+        """Manual Open Video button handler (user-initiated)."""
+        start_dir = getattr(self, "_last_video_dir", os.getcwd())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open video file",
+            start_dir,
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm);;All files (*)"
+        )
+        if not path:
+            return
+        self._last_video_dir = os.path.dirname(path)
+        self.footer.showMessage(f"Opening: {os.path.basename(path)}", 3000)
+        self.start_video_thread(path)
 
     # video frame (receives QImage)
     def update_video_frame(self, qimg: QImage):
-        """
-        Receive and display new video frame.
-        Also detect an all-black frame (video stopped) and set RecordPill[stopped=true].
-        """
-        # show frame in the VideoCanvas (existing behavior)
+        self._last_frame_qimg = qimg
+        # Always just show the base frame; VideoCanvas will overlay if one is set.
         self.video_label.set_frame(qimg)
 
         # --- detect black/blank frame (simple, fast heuristic) ---
@@ -233,9 +434,19 @@ class MainWindow(QMainWindow):
     def set_connection_status(self, connected: bool):
         pill = self.topbar.record_wrap
         pill.setProperty("connected", connected)
-        pill.style().unpolish(pill)
-        pill.style().polish(pill)
+        pill.style().unpolish(pill);
+        pill.style().polish(pill);
         pill.update()
+
+        # also colorize left “Keine Kamera” label via CSS property
+        try:
+            self.topbar.camera_label.setProperty("connected", connected)
+            self.topbar.camera_label.style().unpolish(self.topbar.camera_label)
+            self.topbar.camera_label.style().polish(self.topbar.camera_label)
+            self.topbar.camera_label.update()
+            self.topbar.camera_label.setText("Kamera verbunden" if connected else "Keine Kamera")
+        except Exception:
+            pass
 
     # ROI button behavior
     def on_roi_toggled(self, checked: bool):
@@ -256,8 +467,3 @@ class MainWindow(QMainWindow):
         self.roi_btn.setChecked(False)
         self.comment.clear()
 
-    def closeEvent(self, event):
-        if hasattr(self, "vthread"):
-            self.vthread.stop()
-            self.vthread.wait(500)
-        super().closeEvent(event)
