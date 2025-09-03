@@ -1,9 +1,10 @@
 from __future__ import annotations
+from typing import List, Tuple
 from PySide6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox,
     QSizePolicy
 )
-from PySide6.QtCore import Qt, QSize, QRect, Signal, QPointF, QDateTime
+from PySide6.QtCore import Qt, QSize, QRect, Signal, QPointF
 from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush, QPen, QIcon, QImage, QFont
 from .colors import COLORS
 
@@ -17,7 +18,7 @@ class CircularProgress(QWidget):
         self.setMinimumSize(140, 140)
 
     def setValue(self, val: int):
-        self.value = int(val)
+        self.value = max(0, min(self.max_value, int(val)))
         self.update()
 
     def paintEvent(self, event):
@@ -42,12 +43,14 @@ class CircularProgress(QWidget):
         p.setFont(font)
         p.drawText(rect, Qt.AlignCenter, f"{self.value}%\nAbdeckung")
 
+
 # ----------------------------- iOS Switch ----------------------------
 class Switch(QCheckBox):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setChecked(True)
         self.setText("")
+        self.toggled.connect(self.update)
 
     def sizeHint(self):
         return QSize(40, 20)
@@ -72,6 +75,7 @@ class Switch(QCheckBox):
         p.setPen(QPen(QColor("#E5E7EB")))
         p.drawEllipse(knob_rect)
 
+
 # --------------------------- Simple Header ---------------------------
 class Header(QFrame):
     def __init__(self, icon: str, title: str, right_widget=None):
@@ -89,7 +93,7 @@ class Header(QFrame):
             pixmap = QPixmap(icon).scaled(24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             icon_label.setPixmap(pixmap)
         else:
-            icon_label.setText(icon or "")  # emoji fallback
+            icon_label.setText(icon or "")
         icon_label.setFixedWidth(28)
 
         text = QLabel(title or "")
@@ -101,9 +105,10 @@ class Header(QFrame):
         if right_widget is not None:
             lay.addWidget(right_widget, 0, Qt.AlignRight)
 
+
 # ------------------------------- Card --------------------------------
 class Card(QFrame):
-    """Card without mandatory icon/title so existing usages work."""
+    """Card with optional header (icon/title/right_widget)."""
     def __init__(self, icon: str = "", title: str = "", right_widget=None, parent=None):
         super().__init__(parent)
         self.setObjectName("Card")
@@ -113,7 +118,6 @@ class Card(QFrame):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Optional header if title or icon provided
         self.header = None
         if (icon or title or right_widget is not None):
             self.header = Header(icon, title, right_widget)
@@ -127,7 +131,8 @@ class Card(QFrame):
         inner = QVBoxLayout(self.body)
         inner.setContentsMargins(16, 12, 16, 16)
         inner.setSpacing(10)
-        self.inner_layout = inner  # for external composition
+        self.inner_layout = inner
+
 
 # ------------------------------- TopBar ------------------------------
 class TopBar(QFrame):
@@ -139,41 +144,35 @@ class TopBar(QFrame):
         root.setContentsMargins(16, 8, 16, 8)
         root.setSpacing(12)
 
-        # -------- LEFT: clipart + title + small Demo (all next to each other) --------
+        # LEFT cluster
         left = QHBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
         left.setSpacing(8)
 
-        cam = QLabel()
-        cam.setText("🎥")
+        cam = QLabel("🎥")
         left.addWidget(cam, 0, Qt.AlignVCenter)
 
         title = QLabel("Intraop-Assistenz · Blase")
         title.setObjectName("TopTitle")
-        # important: do NOT let the title expand, or it will push Demo away
         title.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         left.addWidget(title, 0, Qt.AlignVCenter)
 
         demo = QLabel("Demo")
         demo.setObjectName("Badge_Demo")
-        demo.setProperty("small", True)  # use your small-chip style
+        demo.setProperty("small", True)
         demo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         left.addWidget(demo, 0, Qt.AlignVCenter)
 
-        left_wrap = QWidget()
-        left_wrap.setLayout(left)
-        # give the left group some stretch so the right group sits at the far right,
-        # but keep the three items stuck together
-        root.addWidget(left_wrap, 1)  # (was 0)
+        left_wrap = QWidget(); left_wrap.setLayout(left)
+        root.addWidget(left_wrap, 1)
 
-        # -------- RIGHT: patient pill + kamera badge + screenshot --------
+        # RIGHT cluster
         right = QHBoxLayout(); right.setSpacing(12)
 
         self.patient_pill = QLabel("Patient: ID-042")
         self.patient_pill.setObjectName("PatientPill")
         right.addWidget(self.patient_pill)
 
-        # camera badge (keeps name record_wrap for compatibility)
         self.record_wrap = QWidget()
         self.record_wrap.setObjectName("cameraPill")
         pill = QHBoxLayout(self.record_wrap)
@@ -181,11 +180,10 @@ class TopBar(QFrame):
         pill.setSpacing(6)
 
         self.record_icon = QLabel()
+        self.record_icon.setText("📷")  # fallback
         rpix = QPixmap("src/gui/icons/camera.png")
         if not rpix.isNull():
             self.record_icon.setPixmap(rpix.scaled(16, 16, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        else:
-            self.record_icon.setText("📷")
 
         self.record_text = QLabel("Nicht verbunden")
         pill.addWidget(self.record_icon)
@@ -198,34 +196,27 @@ class TopBar(QFrame):
         right.addWidget(self.shot_btn)
 
         right_wrap = QWidget(); right_wrap.setLayout(right)
-        root.addWidget(left_wrap, 0, Qt.AlignLeft)  # <- hard left
-        root.addStretch(1)  # <- spacer between groups
         root.addWidget(right_wrap, 0, Qt.AlignRight)
 
-        # initial state
+        # initial
         self.set_camera_connected(False)
 
-    # toggle only this badge (light gray / light blue + text)
     def set_camera_connected(self, connected: bool):
         txt = "Kamera verbunden" if connected else "Nicht verbunden"
         self.record_text.setText(txt)
 
         from .colors import rgb
-        bg = rgb("light_blue") if connected else rgb("light_light_gray")  # light blue / light gray
+        bg = rgb("light_blue") if connected else rgb("light_light_gray")
         border = rgb("light_blue") if connected else rgb("light_light_gray")
-        fg = rgb("gray") if connected else rgb("gray")
+        fg = rgb("gray")
 
         self.record_wrap.setStyleSheet(f"""
-                QWidget#cameraPill {{
-                    background:{bg}; border:1px solid {border};
-                    padding: 4px 10px;
-                    border-radius:8px;
-                    font-size: 12px;
-                }}
-                QWidget#cameraPill QLabel {{
-                    color:{fg}; font-weight:600;
-                }}
-            """)
+            QWidget#cameraPill {{
+                background:{bg}; border:1px solid {border};
+                padding: 4px 10px; border-radius:8px; font-size: 12px;
+            }}
+            QWidget#cameraPill QLabel {{ color:{fg}; font-weight:600; }}
+        """)
 
     def set_patient_id(self, pid: str):
         self.patient_pill.setText(pid if pid.startswith("Patient") else f"Patient: {pid}")
@@ -244,17 +235,17 @@ class VideoCanvas(QLabel):
         super().__init__()
         self.setObjectName("VideoCanvas")
         self.setAlignment(Qt.AlignCenter)
-        self._overlay = None  # QImage RGBA
-        self._overlay_opacity = 0.7
-        self._roi_mode = False
-        self._markers: list[QPointF] = []
+        self._overlay: QImage | None = None         # RGBA
+        self._overlay_opacity: float = 0.7
+        self._roi_mode: bool = False
+        self._markers: List[Tuple[QPointF, str]] = []
 
     # ---------- public API ----------
     def set_frame(self, qimg: QImage):
         self.setPixmap(QPixmap.fromImage(qimg))
         self.update()
 
-    def set_overlay(self, qimg_rgba: QImage):
+    def set_overlay(self, qimg_rgba: QImage | None):
         self._overlay = qimg_rgba
         self.update()
 
@@ -263,7 +254,6 @@ class VideoCanvas(QLabel):
         self.update()
 
     def set_overlay_opacity(self, value: float):
-        # value expected in [0,1]
         self._overlay_opacity = max(0.0, min(1.0, float(value)))
         self.update()
 
@@ -272,7 +262,6 @@ class VideoCanvas(QLabel):
         self.setCursor(Qt.CrossCursor if self._roi_mode else Qt.ArrowCursor)
 
     def add_marker(self, x: int, y: int, label: int | str | None = None):
-        """Add an 'X' marker with a label like '#1'."""
         if label is None:
             label = len(self._markers) + 1
         label_str = f"#{int(label)}" if isinstance(label, (int, float)) else str(label)
@@ -283,29 +272,12 @@ class VideoCanvas(QLabel):
         self._markers.clear()
         self.update()
 
-    def on_roi_toggled(self, checked: bool):
-        # VideoCanvas exposes set_roi_mode()
-        self.video_label.set_roi_mode(checked)
-
-    def on_roi_marked(self, x: int, y: int):
-        # Add marker to the canvas and log a note
-        self.video_label.add_marker(x, y)
-        t = QDateTime.currentDateTime().toString("yyyy.MM.dd HH:mm")
-        text = self.comment.text().strip() or "Auffälligkeit"
-        line = f"#{self._note_counter} {t} – {text})"
-        self.notes_view.appendPlainText(line)
-        self._note_counter += 1
-        self.roi_btn.setChecked(False)
-        self.comment.clear()
-
-    # ---------- events / painting ----------
+    # ---------- events ----------
     def mousePressEvent(self, ev):
         if self._roi_mode and self.pixmap():
-            # Map widget coords → image coords
             px = self.pixmap()
             if not px:
                 return
-            # Compute the drawn image rect within the label
             pix_w, pix_h = px.width(), px.height()
             lab_w, lab_h = self.width(), self.height()
             scale = min(lab_w / pix_w, lab_h / pix_h)
@@ -314,7 +286,8 @@ class VideoCanvas(QLabel):
             off_y = (lab_h - draw_h) // 2
             x = int((ev.position().x() - off_x) / scale)
             y = int((ev.position().y() - off_y) / scale)
-            self.roiClicked.emit(x, y)
+            if 0 <= x < pix_w and 0 <= y < pix_h:
+                self.roiClicked.emit(x, y)
         else:
             super().mousePressEvent(ev)
 
@@ -323,9 +296,22 @@ class VideoCanvas(QLabel):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        # draw overlay (unchanged) ...
+        # --- overlay (scaled to the drawn image rect) ---
+        if self._overlay is not None and self.pixmap():
+            px = self.pixmap()
+            pix_w, pix_h = px.width(), px.height()
+            lab_w, lab_h = self.width(), self.height()
+            scale = min(lab_w / pix_w, lab_h / pix_h)
+            draw_w, draw_h = int(pix_w * scale), int(pix_h * scale)
+            off_x = (lab_w - draw_w) // 2
+            off_y = (lab_h - draw_h) // 2
 
-        # Draw ROI markers as blue X + label
+            painter.setOpacity(self._overlay_opacity)
+            target = QRect(off_x, off_y, draw_w, draw_h)
+            painter.drawImage(target, self._overlay)
+            painter.setOpacity(1.0)
+
+        # --- ROI markers ---
         if self._markers and self.pixmap():
             px = self.pixmap()
             pix_w, pix_h = px.width(), px.height()
@@ -335,23 +321,16 @@ class VideoCanvas(QLabel):
             off_x = (lab_w - draw_w) // 2
             off_y = (lab_h - draw_h) // 2
 
-            # X style (light blue)
-            light_blue = COLORS.get("light_blue", (64, 184, 255))
-            pen_x = QPen(QColor(*light_blue), 2)
+            pen_x = QPen(QColor(*COLORS.get("light_blue", (64, 184, 255))), 2)
             painter.setPen(pen_x)
 
-            # Label font (kept)
             font = painter.font()
             font.setPointSize(11)
             font.setBold(True)
             painter.setFont(font)
 
-            # X style (light blue)
-            light_blue = COLORS.get("light_blue", (64, 184, 255))
-            pen_x = QPen(QColor(*light_blue), 2)
-
             for p, label_str in self._markers:
-                painter.setPen(pen_x)  # <-- reset for every marker
+                painter.setPen(pen_x)
                 x = off_x + int(p.x() * scale)
                 y = off_y + int(p.y() * scale)
 
@@ -359,19 +338,9 @@ class VideoCanvas(QLabel):
                 painter.drawLine(x - s, y - s, x + s, y + s)
                 painter.drawLine(x - s, y + s, x + s, y - s)
 
-                # label (shadow + white)
                 painter.setPen(QPen(QColor(0, 0, 0, 200)))
                 painter.drawText(x + s + 5, y - s - 2, label_str)
                 painter.setPen(QPen(QColor(255, 255, 255)))
                 painter.drawText(x + s + 4, y - s - 3, label_str)
 
         painter.end()
-
-    def clear_overlay(self):
-        """Remove any overlay and refresh."""
-        # If your set_overlay(None) already clears, you can just call that.
-        try:
-            self.set_overlay(None)
-        except Exception:
-            self._overlay_qimg = None
-            self.update()

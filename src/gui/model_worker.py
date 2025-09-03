@@ -1,50 +1,71 @@
-# model_worker.py — add aliases & error signal
+# model_worker.py — robust model importer + safe dummy overlay
 from __future__ import annotations
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 import numpy as np
 import queue, time, os, importlib
-import torch
+from typing import Optional
 
 try:
-    import lightning.pytorch as pl
+    import torch
+    TORCH_OK = True
 except Exception:
-    pl = None
+    torch = None  # type: ignore
+    TORCH_OK = False
+
+try:
+    import lightning.pytorch as pl  # type: ignore
+except Exception:
+    pl = None  # type: ignore
+
+
+def _import_first(names: list[str]):
+    """Try importing the first module path that succeeds; return module or None."""
+    for n in names:
+        try:
+            return importlib.import_module(n)
+        except Exception:
+            continue
+    return None
+
 
 class ModelWorker(QThread):
-    started_ok = Signal()      # original
-    started = Signal()         # alias for MainWindow
+    started_ok = Signal()
+    started = Signal()
     overlay_ready = Signal(QImage)
     debug = Signal(str)
-    error = Signal(str)        # NEW
+    error = Signal(str)
 
-    def __init__(self,
-                 ckpt_path: str | None = None,
-                 device: str | None = None,
-                 input_size: tuple[int, int] = (512, 512),
-                 color_rgba: tuple[int, int, int, int] = (0, 140, 255, 180),
-                 target_fps: float | None = None,
-                 max_queue: int = 1,
-                 attn_ckpt: str | None = None,
-                 unet_ckpt: str | None = None,
-                 **_: object):
+    def __init__(
+        self,
+        ckpt_path: Optional[str] = None,
+        device: Optional[str] = None,
+        input_size: tuple[int, int] = (512, 512),
+        color_rgba: tuple[int, int, int, int] = (0, 140, 255, 180),
+        target_fps: Optional[float] = None,
+        max_queue: int = 1,
+        attn_ckpt: Optional[str] = None,
+        unet_ckpt: Optional[str] = None,
+        **_: object,
+    ):
         super().__init__()
         self.daemon = True
         self.ckpt_path = ckpt_path or os.environ.get("MODEL_CKPT", "")
         self.attn_ckpt = attn_ckpt or os.environ.get("ATTN_CKPT")
         self.unet_ckpt = unet_ckpt or os.environ.get("UNET_CKPT")
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if TORCH_OK and torch.cuda.is_available() else "cpu")
         self.input_size = input_size
         self.color_rgba = color_rgba
         self.target_delay = (1.0 / float(target_fps)) if (target_fps and target_fps > 0) else None
 
-        self._q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=max(1, int(max_queue)))
+        import queue as _q
+        self._q: "_q.Queue[np.ndarray | None]" = _q.Queue(maxsize=max(1, int(max_queue)))
         self._running = False
         self._enabled = True
         self._model = None
-        self._use_dummy = False
+        self._use_dummy = not TORCH_OK  # if no torch, force dummy
 
-    # public API
+    # ---------------- public API ----------------
     def feed_frame(self, rgb_frame: np.ndarray) -> None:
         if not isinstance(rgb_frame, np.ndarray) or rgb_frame.ndim != 3:
             return
@@ -55,24 +76,24 @@ class ModelWorker(QThread):
         except Exception:
             pass
 
-    # alias expected by MainWindow
+    # Backward-compat
     def enqueue_frame(self, rgb_frame: np.ndarray) -> None:
         self.feed_frame(rgb_frame)
 
     def set_enabled(self, on: bool) -> None:
         self._enabled = bool(on)
 
-    # thread
+    # ---------------- thread ----------------
     def run(self):
         self._running = True
         self._log("ModelWorker starting…")
         try:
-            self._load_model()
+            if not self._use_dummy:
+                self._load_model()
         except Exception as e:
             self._use_dummy = True
             self.error.emit(f"Model load failed: {e}")
 
-        # fire both signals for compatibility
         self.started_ok.emit()
         self.started.emit()
 
@@ -86,8 +107,8 @@ class ModelWorker(QThread):
                 continue
 
             try:
-                # disabled → emit empty transparent overlay of same size
                 if not self._enabled:
+                    # Emit transparent overlay of same size
                     h, w, _ = frame.shape
                     empty = QImage(w, h, QImage.Format_RGBA8888)
                     empty.fill(0)
@@ -111,7 +132,6 @@ class ModelWorker(QThread):
 
     def stop(self):
         self._running = False
-        # unblock the .get(timeout=...) immediately
         try:
             self._q.put_nowait(None)
         except Exception:
@@ -128,16 +148,27 @@ class ModelWorker(QThread):
         except Exception:
             pass
 
-    # model loading
+    # ---------------- model loading ----------------
     def _load_model(self) -> None:
-        try:
-            hac_mod = importlib.import_module(".hac_joint_module", package=__package__)
-            HACJointModule = getattr(hac_mod, "HACJointModule")
-        except Exception as e:
-            self._log(f"Import HACJointModule failed ({e}). Using dummy overlay.")
+        # Try multiple paths so GUI can live in src/gui and models in src/models or src/hac/models
+        hac_mod = _import_first([
+            "src.hac.models.hac_joint_module",
+            "src.models.hac_joint_module",
+            "hac_joint_module",
+            f"{__package__}.hac_joint_module" if __package__ else "hac_joint_module",
+        ])
+        if hac_mod is None:
+            self._log("Import HACJointModule failed. Using dummy overlay.")
             self._use_dummy = True
             return
 
+        HACJointModule = getattr(hac_mod, "HACJointModule", None)
+        if HACJointModule is None:
+            self._log("HACJointModule symbol not found. Using dummy overlay.")
+            self._use_dummy = True
+            return
+
+        # Load from checkpoint if given; otherwise expect attn/unet ckpts
         if self.ckpt_path and os.path.exists(self.ckpt_path):
             try:
                 if pl is not None and hasattr(HACJointModule, "load_from_checkpoint"):
@@ -148,53 +179,50 @@ class ModelWorker(QThread):
                 else:
                     self._model = HACJointModule.from_checkpoint(self.ckpt_path, device=self.device)  # type: ignore
                 self._model.eval().to(self.device)
-                self._log("Loaded HAC from checkpoint.")
+                self._log("Loaded HAC model from checkpoint.")
                 return
             except Exception as e:
                 self._log(f"HAC load_from_checkpoint failed: {e}")
                 self.error.emit(f"HAC load failed: {e}")
 
-        # fallback to UNet
-        try:
-            u_mod = importlib.import_module(".unet_module", package=__package__)
-            UNetModule = getattr(u_mod, "UNetModule")
-            if self.ckpt_path and os.path.exists(self.ckpt_path) and pl is not None and hasattr(UNetModule, "load_from_checkpoint"):
-                self._model = UNetModule.load_from_checkpoint(self.ckpt_path, map_location=self.device)
+        # If we get here, no full ckpt; try to construct from partial ckpts/configs if supported
+        if self.attn_ckpt or self.unet_ckpt:
+            try:
+                self._model = HACJointModule(attn_ckpt=self.attn_ckpt, unet_ckpt=self.unet_ckpt)
                 self._model.eval().to(self.device)
-                self._log("Loaded UNet fallback from checkpoint.")
+                self._log("Constructed HAC from partial ckpts.")
                 return
-        except Exception as e:
-            self._log(f"UNet fallback failed: {e}")
+            except Exception as e:
+                self._log(f"Partial HAC construction failed: {e}")
 
         self._log("No model available — using dummy overlay.")
         self._use_dummy = True
 
-    # inference
-    @torch.no_grad()
+    # ---------------- inference ----------------
     def _infer_overlay(self, frame: np.ndarray) -> QImage:
         h, w, _ = frame.shape
-        if self._use_dummy or self._model is None:
-            # simple edge magnitude → mask
+        if self._use_dummy or self._model is None or not TORCH_OK:
+            # Fast edge magnitude → mask
             gray = np.dot(frame[..., :3].astype(np.float32), [0.299, 0.587, 0.114])
-            x = np.transpose(x, (2, 0, 1))[None, ...]
             gy, gx = np.gradient(gray)
             mag = np.sqrt(gx * gx + gy * gy)
             mag = (mag / (mag.max() + 1e-6))
             mask = (mag > 0.25).astype(np.uint8)
         else:
-            from PIL import Image
-            img = Image.fromarray(frame).resize(self.input_size)
-            x = np.asarray(img).astype(np.float32) / 255.0
-            x = np.transpose(x, (2, 0, 1))[None, ...]
-            x = torch.from_numpy(x).to(self.device)
-            out = self._model(x)
-            logits = out[1] if isinstance(out, (list, tuple)) and len(out) > 1 else out
-            if logits.ndim == 4 and logits.size(1) > 1:
-                prob = torch.softmax(logits, dim=1)[:, 1:2]
-            else:
-                prob = torch.sigmoid(logits)
-            prob = torch.nn.functional.interpolate(prob, size=(h, w), mode="bilinear", align_corners=False)
-            mask = (prob >= 0.5).float().cpu().numpy()[0, 0].astype(np.uint8)
+            import PIL.Image as PILImage
+            with torch.no_grad():  # type: ignore
+                img = PILImage.fromarray(frame).resize(self.input_size)
+                x = np.asarray(img).astype(np.float32) / 255.0
+                x = np.transpose(x, (2, 0, 1))[None, ...]
+                x_t = torch.from_numpy(x).to(self.device)  # type: ignore
+                out = self._model(x_t)
+                logits = out[1] if isinstance(out, (list, tuple)) and len(out) > 1 else out
+                if logits.ndim == 4 and logits.size(1) > 1:  # type: ignore
+                    prob = torch.softmax(logits, dim=1)[:, 1:2]  # type: ignore
+                else:
+                    prob = torch.sigmoid(logits)  # type: ignore
+                prob = torch.nn.functional.interpolate(prob, size=(h, w), mode="bilinear", align_corners=False)  # type: ignore
+                mask = (prob >= 0.5).float().cpu().numpy()[0, 0].astype(np.uint8)  # type: ignore
 
         r, g, b, a = self.color_rgba
         alpha = (mask * a).astype(np.uint8)
@@ -208,4 +236,7 @@ class ModelWorker(QThread):
         return qimg.copy()
 
     def _log(self, s: str) -> None:
-        self.debug.emit(s)
+        try:
+            self.debug.emit(s)
+        except Exception:
+            pass
