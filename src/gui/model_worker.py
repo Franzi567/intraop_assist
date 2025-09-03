@@ -1,284 +1,211 @@
-# model_worker.py
+# model_worker.py — add aliases & error signal
+from __future__ import annotations
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
-from PIL import Image
 import numpy as np
-import queue, time, os, inspect, importlib
-
-# torch is required for inference types/ops
+import queue, time, os, importlib
 import torch
 
-# Optional Lightning (only for isinstance checks)
 try:
-    import lightning.pytorch as pl  # type: ignore
+    import lightning.pytorch as pl
 except Exception:
     pl = None
 
-
-def _parse_rgba_env(name: str, default=(255, 0, 0, 255)):
-    """
-    Accepts:
-      - "r,g,b" or "r,g,b,a"
-      - "#RRGGBB" or "#RRGGBBAA"
-    """
-    s = os.environ.get(name, "").strip()
-    if not s:
-        return default
-    try:
-        if s.startswith("#"):
-            s = s[1:]
-            if len(s) == 6:
-                r = int(s[0:2], 16); g = int(s[2:4], 16); b = int(s[4:6], 16); a = 255
-            elif len(s) == 8:
-                r = int(s[0:2], 16); g = int(s[2:4], 16); b = int(s[4:6], 16); a = int(s[6:8], 16)
-            else:
-                return default
-            return (r, g, b, a)
-        parts = [int(x.strip()) for x in s.split(",")]
-        if len(parts) == 3:
-            return (parts[0], parts[1], parts[2], 255)
-        if len(parts) == 4:
-            return (parts[0], parts[1], parts[2], parts[3])
-    except Exception:
-        pass
-    return default
-
-
 class ModelWorker(QThread):
+    started_ok = Signal()      # original
+    started = Signal()         # alias for MainWindow
     overlay_ready = Signal(QImage)
-    error = Signal(str)
-    started_ok = Signal()
+    debug = Signal(str)
+    error = Signal(str)        # NEW
 
-    def __init__(
-        self,
-        target_fps: int = 5,
-        max_queue: int = 2,
-        hac_wrapper_cls=None,
-        device=None,
-    ):
-        """
-        target_fps: processing rate (approx)
-        max_queue: frames buffered
-        hac_wrapper_cls: optional class to use for HACWrapper (for testing)
-        device: optional device string/torch.device forwarded to HACWrapper
-        """
+    def __init__(self,
+                 ckpt_path: str | None = None,
+                 device: str | None = None,
+                 input_size: tuple[int, int] = (512, 512),
+                 color_rgba: tuple[int, int, int, int] = (0, 140, 255, 180),
+                 target_fps: float | None = None,
+                 max_queue: int = 1,
+                 attn_ckpt: str | None = None,
+                 unet_ckpt: str | None = None,
+                 **_: object):
         super().__init__()
-        self.target_fps = max(1, int(target_fps))
-        self._period = 1.0 / self.target_fps
-        self._q = queue.Queue(maxsize=max_queue)
-        self._running = True
-        self._hac = None
-        self.hac_wrapper_cls = hac_wrapper_cls
-        self.device = device
+        self.daemon = True
+        self.ckpt_path = ckpt_path or os.environ.get("MODEL_CKPT", "")
+        self.attn_ckpt = attn_ckpt or os.environ.get("ATTN_CKPT")
+        self.unet_ckpt = unet_ckpt or os.environ.get("UNET_CKPT")
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.input_size = input_size
+        self.color_rgba = color_rgba
+        self.target_delay = (1.0 / float(target_fps)) if (target_fps and target_fps > 0) else None
 
-        # --- overlay shaping knobs from environment ---
-        # Only probabilities above OVERLAY_THR contribute to alpha (after normalization).
-        self._ov_thr = float(os.environ.get("OVERLAY_THR", 0.5))
-        # OVERLAY_GAMMA > 1.0 compresses low confidences; < 1.0 expands them.
-        self._ov_gamma = float(os.environ.get("OVERLAY_GAMMA", 1.5))
-        # OVERLAY_COLOR e.g. "0,255,0,255" or "#00FF00CC"
-        self._ov_color = _parse_rgba_env("OVERLAY_COLOR", (255, 0, 0, 255))
+        self._q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=max(1, int(max_queue)))
+        self._running = False
+        self._enabled = True
+        self._model = None
+        self._use_dummy = False
 
-    # ---------------- thread entry ----------------
-    def run(self):
-        # lazy import / load inside thread
-        try:
-            if self.hac_wrapper_cls is None:
-                # standard location for your wrapper
-                mod = importlib.import_module("server.models.hac_wrapper")
-                self.hac_wrapper_cls = getattr(mod, "HACWrapper")
-            # instantiate (handle ctor signatures)
-            try:
-                self._hac = self.hac_wrapper_cls(device=self.device) if self.device is not None else self.hac_wrapper_cls()
-            except TypeError:
-                self._hac = self.hac_wrapper_cls()
-        except Exception as e:
-            self.error.emit(f"Model load failed: {e}")
+    # public API
+    def feed_frame(self, rgb_frame: np.ndarray) -> None:
+        if not isinstance(rgb_frame, np.ndarray) or rgb_frame.ndim != 3:
             return
-
-        self.started_ok.emit()
-        last_time = 0.0
-
-        while self._running:
-            try:
-                frame = self._q.get(timeout=0.25)  # numpy RGB (H,W,3) uint8
-            except queue.Empty:
-                continue
-
-            now = time.time()
-            if (now - last_time) < self._period:
-                # throttle to target_fps
-                continue
-            last_time = now
-
-            try:
-                pil = Image.fromarray(frame)  # RGB
-                # Prefer the wrapper’s own overlay method if available
-                if hasattr(self._hac, "infer_to_overlay"):
-                    overlay_pil = self._hac.infer_to_overlay(pil)
-                    if overlay_pil.mode != "RGBA":
-                        overlay_pil = overlay_pil.convert("RGBA")
-                else:
-                    # Fallback: do inference here and build overlay with thr/gamma
-                    overlay_pil = self._infer_and_build_overlay(pil)
-
-                # → QImage (RGBA8888)
-                w, h = overlay_pil.size
-                data = overlay_pil.tobytes("raw", "RGBA")
-                qimg = QImage(data, w, h, QImage.Format.Format_RGBA8888).copy()
-                self.overlay_ready.emit(qimg)
-
-            except Exception as e:
-                self.error.emit(f"Inference error: {e}")
-
-        return
-
-    # ----------------- helper: inference + overlay -----------------
-    def _infer_and_build_overlay(self, pil_img: Image.Image) -> Image.Image:
-        """
-        Fallback path if HACWrapper lacks infer_to_overlay():
-          - Try HACWrapper.infer() if present; otherwise call (preprocess → model)
-          - Unify outputs (tuple/dict/tensor)
-          - Convert logits→prob if needed
-          - Build RGBA overlay with threshold+gamma mapping
-        """
-        # Try wrapper.infer(pil)
-        out = None
-        if hasattr(self._hac, "infer"):
-            out = self._hac.infer(pil_img)
-        else:
-            # Try raw model with wrapper.preprocess
-            if not hasattr(self._hac, "model"):
-                raise RuntimeError("HAC interface provides neither infer_to_overlay nor infer/model.")
-            if not hasattr(self._hac, "preprocess"):
-                # Minimal preprocess if wrapper has none
-                # Default input size via env: MODEL_INPUT_SIZE="512,512"
-                in_size = tuple(map(int, os.environ.get("MODEL_INPUT_SIZE", "512,512").split(",")))
-                img = pil_img.resize(in_size, Image.BILINEAR).convert("RGB")
-                arr = np.asarray(img).astype("float32") / 255.0
-                inp = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-                dev = getattr(self._hac, "device", torch.device("cpu"))
-                inp = inp.to(dev)
-            else:
-                inp = self._hac.preprocess(pil_img)
-
-            dev = getattr(self._hac, "device", torch.device("cpu"))
-            model = self._hac.model
-            model.eval()
-            with torch.no_grad(), torch.autocast(device_type=(dev.type if isinstance(dev, torch.device) else "cuda"),
-                                                 enabled=(isinstance(dev, torch.device) and dev.type == "cuda")):
-                out = model(inp)
-
-        # --- unify output to a single 4D tensor (B,1,H,W) logits/probs ---
-        out = self._select_tensor_from_output(out)
-
-        # --- to probabilities (numpy HxW) ---
-        prob = self._tensor_to_prob(out)
-
-        # --- build colored RGBA overlay with threshold + gamma ---
-        overlay = self._prob_to_rgba_overlay(prob, pil_img.size)
-        return overlay
-
-    # ----------------- tensor utilities -----------------
-    def _select_tensor_from_output(self, out):
-        """Pick the most likely segmentation tensor from tuple/dict/tensor outputs."""
-        if torch.is_tensor(out):
-            return out
-        if isinstance(out, (list, tuple)):
-            tensors = [t for t in out if torch.is_tensor(t)]
-            # Prefer 4D tensors (B,C,H,W); pick the last (often segmentation logits)
-            four_d = [t for t in tensors if t.ndim == 4]
-            if four_d:
-                return four_d[-1]
-            if tensors:
-                return tensors[-1]
-            raise RuntimeError("Model returned tuple/list without tensor entries.")
-        if isinstance(out, dict):
-            for key in ("mask", "pred", "out", "logits", "probs", "prediction", "seg_logits"):
-                if key in out and torch.is_tensor(out[key]):
-                    return out[key]
-            vals = [v for v in out.values() if torch.is_tensor(v)]
-            if not vals:
-                raise RuntimeError("Model returned dict without tensor values.")
-            return vals[0]
-        raise RuntimeError(f"Unsupported model output type: {type(out)}")
-
-    def _tensor_to_prob(self, t: torch.Tensor) -> np.ndarray:
-        """
-        Convert logits/probs tensor to (H,W) numpy probabilities in [0,1].
-        """
-        # Make sure it's on CPU and detached
-        # Detect logits by range and apply sigmoid if needed
-        if t.max() > 1.5 or t.min() < -0.5:
-            p = torch.sigmoid(t)
-        else:
-            p = t
-        if p.ndim == 4:
-            # Use first channel
-            p = p[:, 0:1, :, :]
-        p = p.squeeze().detach().cpu().numpy().astype("float32")
-        # Clamp numerically
-        return np.clip(p, 0.0, 1.0)
-
-    def _prob_to_rgba_overlay(self, prob: np.ndarray, out_size) -> Image.Image:
-        """
-        Map prob → alpha using threshold + gamma, then colorize as RGBA.
-        """
-        thr = float(self._ov_thr)
-        gamma = float(self._ov_gamma)
-        # keep only values above threshold, renormalize to 0..1
-        if thr > 0.0:
-            prob = np.clip((prob - thr) / max(1e-6, 1.0 - thr), 0.0, 1.0)
-        # apply gamma (gamma>1 suppresses low alphas)
-        if abs(gamma - 1.0) > 1e-6:
-            prob = prob ** (1.0 / gamma)
-
-        alpha = (prob * 255.0).astype("uint8")
-        a_img = Image.fromarray(alpha, mode="L")
-
-        r, g, b, a = self._ov_color  # base color (we’ll override alpha)
-        overlay = Image.new("RGBA", a_img.size, (r, g, b, 0))
-        overlay.putalpha(a_img)
-
-        if a != 255:
-            # global alpha cap from color's A
-            # multiply current alpha by a/255
-            if a < 255:
-                alpha_scaled = (alpha.astype(np.uint16) * a // 255).astype("uint8")
-                overlay = Image.merge("RGBA", (
-                    Image.new("L", a_img.size, r),
-                    Image.new("L", a_img.size, g),
-                    Image.new("L", a_img.size, b),
-                    Image.fromarray(alpha_scaled, mode="L")
-                ))
-
-        if overlay.size != out_size:
-            overlay = overlay.resize(out_size, Image.BILINEAR)
-        return overlay
-
-    # ----------------- public API -----------------
-    def enqueue_frame(self, arr: np.ndarray):
         try:
-            if not isinstance(arr, np.ndarray):
-                return
-            if not arr.flags["C_CONTIGUOUS"]:
-                arr = np.ascontiguousarray(arr)
             if self._q.full():
-                try:
-                    self._q.get_nowait()
-                except Exception:
-                    pass
-            self._q.put_nowait(arr)
+                _ = self._q.get_nowait()
+            self._q.put_nowait(rgb_frame)
         except Exception:
             pass
+
+    # alias expected by MainWindow
+    def enqueue_frame(self, rgb_frame: np.ndarray) -> None:
+        self.feed_frame(rgb_frame)
+
+    def set_enabled(self, on: bool) -> None:
+        self._enabled = bool(on)
+
+    # thread
+    def run(self):
+        self._running = True
+        self._log("ModelWorker starting…")
+        try:
+            self._load_model()
+        except Exception as e:
+            self._use_dummy = True
+            self.error.emit(f"Model load failed: {e}")
+
+        # fire both signals for compatibility
+        self.started_ok.emit()
+        self.started.emit()
+
+        last_emit = 0.0
+        while self._running:
+            try:
+                frame = self._q.get(timeout=0.25)
+            except Exception:
+                continue
+            if frame is None:
+                continue
+
+            try:
+                # disabled → emit empty transparent overlay of same size
+                if not self._enabled:
+                    h, w, _ = frame.shape
+                    empty = QImage(w, h, QImage.Format_RGBA8888)
+                    empty.fill(0)
+                    self.overlay_ready.emit(empty)
+                    continue
+
+                if self.target_delay is not None:
+                    now = time.time()
+                    wait = self.target_delay - (now - last_emit)
+                    if wait > 0:
+                        time.sleep(wait)
+
+                qimg = self._infer_overlay(frame)
+                self.overlay_ready.emit(qimg)
+                last_emit = time.time()
+            except Exception as e:
+                self.error.emit(f"Inference error: {e}")
+                self._log(f"Inference error: {e}")
+
+        self._log("ModelWorker stopped.")
 
     def stop(self):
         self._running = False
+        # unblock the .get(timeout=...) immediately
         try:
-            self.wait(300)
+            self._q.put_nowait(None)
+        except Exception:
+            pass
+        try:
+            if self.isRunning():
+                self.wait(1500)
         except Exception:
             pass
 
+    def __del__(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
 
+    # model loading
+    def _load_model(self) -> None:
+        try:
+            hac_mod = importlib.import_module(".hac_joint_module", package=__package__)
+            HACJointModule = getattr(hac_mod, "HACJointModule")
+        except Exception as e:
+            self._log(f"Import HACJointModule failed ({e}). Using dummy overlay.")
+            self._use_dummy = True
+            return
 
+        if self.ckpt_path and os.path.exists(self.ckpt_path):
+            try:
+                if pl is not None and hasattr(HACJointModule, "load_from_checkpoint"):
+                    kw = {"map_location": self.device}
+                    if self.attn_ckpt: kw["attn_ckpt"] = self.attn_ckpt
+                    if self.unet_ckpt: kw["unet_ckpt"] = self.unet_ckpt
+                    self._model = HACJointModule.load_from_checkpoint(self.ckpt_path, **kw)
+                else:
+                    self._model = HACJointModule.from_checkpoint(self.ckpt_path, device=self.device)  # type: ignore
+                self._model.eval().to(self.device)
+                self._log("Loaded HAC from checkpoint.")
+                return
+            except Exception as e:
+                self._log(f"HAC load_from_checkpoint failed: {e}")
+                self.error.emit(f"HAC load failed: {e}")
 
+        # fallback to UNet
+        try:
+            u_mod = importlib.import_module(".unet_module", package=__package__)
+            UNetModule = getattr(u_mod, "UNetModule")
+            if self.ckpt_path and os.path.exists(self.ckpt_path) and pl is not None and hasattr(UNetModule, "load_from_checkpoint"):
+                self._model = UNetModule.load_from_checkpoint(self.ckpt_path, map_location=self.device)
+                self._model.eval().to(self.device)
+                self._log("Loaded UNet fallback from checkpoint.")
+                return
+        except Exception as e:
+            self._log(f"UNet fallback failed: {e}")
+
+        self._log("No model available — using dummy overlay.")
+        self._use_dummy = True
+
+    # inference
+    @torch.no_grad()
+    def _infer_overlay(self, frame: np.ndarray) -> QImage:
+        h, w, _ = frame.shape
+        if self._use_dummy or self._model is None:
+            # simple edge magnitude → mask
+            gray = np.dot(frame[..., :3].astype(np.float32), [0.299, 0.587, 0.114])
+            x = np.transpose(x, (2, 0, 1))[None, ...]
+            gy, gx = np.gradient(gray)
+            mag = np.sqrt(gx * gx + gy * gy)
+            mag = (mag / (mag.max() + 1e-6))
+            mask = (mag > 0.25).astype(np.uint8)
+        else:
+            from PIL import Image
+            img = Image.fromarray(frame).resize(self.input_size)
+            x = np.asarray(img).astype(np.float32) / 255.0
+            x = np.transpose(x, (2, 0, 1))[None, ...]
+            x = torch.from_numpy(x).to(self.device)
+            out = self._model(x)
+            logits = out[1] if isinstance(out, (list, tuple)) and len(out) > 1 else out
+            if logits.ndim == 4 and logits.size(1) > 1:
+                prob = torch.softmax(logits, dim=1)[:, 1:2]
+            else:
+                prob = torch.sigmoid(logits)
+            prob = torch.nn.functional.interpolate(prob, size=(h, w), mode="bilinear", align_corners=False)
+            mask = (prob >= 0.5).float().cpu().numpy()[0, 0].astype(np.uint8)
+
+        r, g, b, a = self.color_rgba
+        alpha = (mask * a).astype(np.uint8)
+        rgba = np.dstack([
+            np.full_like(mask, r, np.uint8),
+            np.full_like(mask, g, np.uint8),
+            np.full_like(mask, b, np.uint8),
+            alpha,
+        ])
+        qimg = QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888)
+        return qimg.copy()
+
+    def _log(self, s: str) -> None:
+        self.debug.emit(s)

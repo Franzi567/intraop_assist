@@ -22,6 +22,7 @@ QMainWindow {{
   background: transparent;
   border: none;
 }}
+
 QStatusBar::item {{ border: 0; border-radius: 0; background: transparent; }}
 
 /* -------- Cards -------- */
@@ -104,7 +105,7 @@ QSlider::handle:horizontal {{
   margin-left: 6px;
   min-height: 20px;           /* match the computed height of PatientPill */
   max-height: 20px;           /* prevent growing taller */
-  qproperty-alignment: 'AlignVCenter';
+  qproperty-alignment: 'AlignCenter';
 }}
 
 /* Ensure title has proper styling for the first row */
@@ -122,7 +123,7 @@ QSlider::handle:horizontal {{
   padding-left: 6px;
   padding-right: 6px;
   min-width: 60px;
-  max-width: 260px;
+  max-width: 160px;
   qproperty-alignment: 'AlignVCenter'; /* keep it vertically centered */
 }}
 
@@ -217,10 +218,30 @@ QSlider::handle:horizontal {{
 }}
 #ROIButton:hover {{
   background: {rgb("light_light_blue")};
+  border: 1px solid {rgb("light_light_blue")};
 }}
 #ROIButton:checked, #ROIButton:pressed {{
   background: {rgb("light_blue")};
   color: {rgb("white")};
+  border: none;
+}}
+
+/* OpenVideo button: hover light-light gray, checked/pressed light gray */
+#OpenVideoButton {{
+  background: {rgb("gray")};
+  color: {rgb("white")};
+  border: 1px solid {rgb("gray")};
+  border-radius: 8px;
+  padding: 6px 6px;
+}}
+#OpenVideoButton:hover {{
+  background: {rgb("light_gray")};
+  border: 1px solid {rgb("light_gray")};
+  color: {rgb("white")};
+}}
+#OpenVideoButton:checked, #OpenVideoButton:pressed {{
+  background: {rgb("light_light_gray")};
+  color: {rgb("light_gray")};
   border: none;
 }}
 """

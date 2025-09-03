@@ -44,6 +44,13 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="fkrauss@grkwst01.isys.uni-stuttgart.de:22 password (15)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="fkrauss@grkwst01.isys.uni-stuttgart.de:22 password (2)">
         <serverdata>
           <mappings>

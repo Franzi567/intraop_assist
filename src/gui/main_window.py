@@ -8,6 +8,7 @@ from PySide6.QtGui import QPixmap, QImage, QPalette, QColor
 
 from datetime import datetime
 import os
+import numpy as np
 
 from .video_thread import VideoThread
 
@@ -23,7 +24,7 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(central); outer.setContentsMargins(0,0,0,0); outer.setSpacing(8)
         self.setWindowTitle("Intraoperative Assistenz - Harnblase")
         self._note_counter = 1
-        self._pending_video_src = r"C:\Git\intraop_assist\data\Video_Snippet_1.mp4"
+        #self._pending_video_src = r"C:\Git\intraop_assist\data\Video_Snippet_1.mp4"
 
         # Top Bar
         self.topbar = TopBar()
@@ -77,6 +78,8 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.footer)
 
         # create "Open video" button (user can manually pick a file)
+        self._camera_connected = False
+        self.topbar.set_camera_connected(False)
         self.open_video_btn = QPushButton("Open video")
         self.open_video_btn.setObjectName("OpenVideoButton")
         self.open_video_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -99,13 +102,15 @@ class MainWindow(QMainWindow):
 
         # connect worker signals
         self.model_worker.overlay_ready.connect(self.on_overlay_ready)
-        self.model_worker.error.connect(lambda msg: self.footer.showMessage(msg, 5000))
-        self.model_worker.started_ok.connect(lambda: self.footer.showMessage("Model loaded", 3000))
+        if hasattr(self.model_worker, "debug"):
+            self.model_worker.debug.connect(lambda msg: self.footer.showMessage(msg, 5000))
+        if hasattr(self.model_worker, "started_ok"):
+            self.model_worker.started_ok.connect(self.on_model_ready)
 
         # start worker thread
         self.model_worker.start()
-
-        self.vessel_toggle.toggled.connect(lambda on: self._on_vessel_toggle(on))
+        # start the video now; if no camera on 'auto', a file picker pops up
+        self.start_video_thread("auto")
 
         # Slider + ROI + Kommentar
         self.overlay_slider = QSlider(Qt.Horizontal);
@@ -117,8 +122,12 @@ class MainWindow(QMainWindow):
         slider_row.addWidget(self.overlay_slider)
         # slider controlling overlay opacity (0..1)
         self.overlay_slider.valueChanged.connect(lambda v: self.video_label.set_overlay_opacity(v / 100.0))
+        self.vessel_toggle.toggled.connect(self.model_worker.set_enabled)
+        self.vessel_toggle.toggled.connect(self._on_vessel_toggle)
+        self.vessel_toggle.toggled.connect(
+            lambda on: getattr(self.model_worker, "set_enabled")(bool(on)) if hasattr(self, "model_worker") else None
+        )
 
-        self.vessel_toggle.toggled.connect(lambda on: None if on else self.video_label.clear_overlay())
         roi_row = QHBoxLayout()
 
         self.roi_btn = QPushButton("ROI markieren")
@@ -147,7 +156,7 @@ class MainWindow(QMainWindow):
 
         # connect ROI logic
         self.roi_btn.toggled.connect(self.on_roi_toggled)
-        self.video_label.roi_marked.connect(self.on_roi_marked)
+        self.video_label.roiClicked.connect(self.on_roi_marked)
 
         video_card.inner_layout.addLayout(slider_row)
         video_card.inner_layout.addLayout(roi_row)
@@ -175,32 +184,67 @@ class MainWindow(QMainWindow):
         notes_card.inner_layout.addWidget(self.notes_view)
 
         # Add left side
-        left_col.addWidget(video_card, 3)
+        left_col.addWidget(video_card)
         row = QWidget(); row_layout = QHBoxLayout(row); row_layout.setContentsMargins(0,0,0,0); row_layout.setSpacing(16)
         row_layout.addWidget(cov_card, 1); row_layout.addWidget(score_card, 1)
-        left_col.addWidget(row, 1)
-        left_col.addWidget(notes_card, 1)
+        left_col.addWidget(row)
+        left_col.addWidget(notes_card)
+
+        left_col.setStretch(0, 3)  # video
+        left_col.setStretch(1, 1)  # row with Abdeckung + Gewebe-Score
+        left_col.setStretch(2, 1)  # Notizen
 
         left_wrap = QWidget(); left_wrap.setLayout(left_col)
+        #
+        # # Right column
+        # model_card = Card("src/gui/icons/Bladder.png", "Digitales Blasenmodell")
+        # self.model_area = QLabel("3D-Modell (Platzhalter)")
+        # self.model_area.setObjectName("ModelArea")
+        # self.model_area.setAlignment(Qt.AlignCenter)
+        # model_card.inner_layout.addWidget(self.model_area, 1)
+        #
+        # root.addWidget(left_wrap, 2)
+        # root.addWidget(model_card, 3)
 
-        # Right column
-        model_card = Card("src/gui/icons/Bladder.png", "Digitales Blasenmodell")
+        self.open_video_btn.clicked.connect(self.on_open_video_clicked)
+
+        # --- Right column (TOP: model, BOTTOM: extra area) ---
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(16)
+
+        # TOP card: Digitales Blasenmodell (as before)
+        model_card = Card("src/gui/icons/bladder.png", "Digitales Blasenmodell")
         self.model_area = QLabel("3D-Modell (Platzhalter)")
         self.model_area.setObjectName("ModelArea")
         self.model_area.setAlignment(Qt.AlignCenter)
         model_card.inner_layout.addWidget(self.model_area, 1)
+        right_col.addWidget(model_card)  # <- matches left video (stretch 3)
 
+        # BOTTOM card: new extra area (bottom-right corner)
+        extra_card = Card("src/gui/icons/navigation.png", "Navigation")
+        extra_placeholder = QLabel("Inhalt (Platzhalter)")
+        extra_placeholder.setAlignment(Qt.AlignCenter)
+        extra_card.inner_layout.addWidget(extra_placeholder, 1)
+        right_col.addWidget(extra_card)  # <- matches left (Abdeckung/Score + Notizen) = 1 + 1
+        right_col.setStretch(0, 3)  # top matches left video
+        right_col.setStretch(1, 1)  # bottom matches left "row" height
+
+        # Wrap the right column
+        right_wrap = QWidget()
+        right_wrap.setLayout(right_col)
+
+        # Add to root layout
+        # (Replace your previous: root.addWidget(model_card, 3))
         root.addWidget(left_wrap, 2)
-        root.addWidget(model_card, 3)
-
-        self.open_video_btn.clicked.connect(self.on_open_video_clicked)
+        root.addWidget(right_wrap, 3)
 
     def on_model_ready(self):
         """Called when ModelWorker finished loading."""
         self._model_ready = True
         self.footer.showMessage("Modell geladen – starte Video…", 3000)
         # Start the video now (using whatever source we have queued)
-        self.start_video_thread(self._pending_video_src)
+        self.start_video_thread("auto")
 
     def on_open_video_clicked(self):
         """Manual Open Video button handler (user-initiated)."""
@@ -227,11 +271,11 @@ class MainWindow(QMainWindow):
             )
 
     def on_frame_for_model(self, np_frame):
-        try:
-            if hasattr(self, "model_worker") and getattr(self.model_worker, "enqueue_frame", None):
-                self.model_worker.enqueue_frame(np_frame)
-        except Exception:
-            pass
+       try:
+           if hasattr(self, "model_worker") and getattr(self.model_worker, "feed_frame", None):
+               self.model_worker.feed_frame(np_frame)
+       except Exception:
+           pass
 
     def on_overlay_ready(self, overlay_qimg: QImage):
         self._last_overlay_qimg = overlay_qimg
@@ -241,11 +285,18 @@ class MainWindow(QMainWindow):
 
     def _on_vessel_toggle(self, on: bool):
         if not on:
-            self.video_label.clear_overlay()
-            if self._last_frame_qimg is not None:
+            if hasattr(self.video_label, "clear_overlay"):
+                self.video_label.clear_overlay()
+            else:
+                # Fallback: set a fully transparent/empty overlay
+                try:
+                    self.video_label.set_overlay(None)
+                except Exception:
+                    pass
+            if getattr(self, "_last_frame_qimg", None) is not None:
                 self.video_label.set_frame(self._last_frame_qimg)
         else:
-            if self._last_overlay_qimg is not None:
+            if getattr(self, "_last_overlay_qimg", None) is not None:
                 self.video_label.set_overlay(self._last_overlay_qimg)
                 self.video_label.set_overlay_opacity(self.overlay_slider.value() / 100.0)
 
@@ -298,12 +349,7 @@ class MainWindow(QMainWindow):
             super().closeEvent(event)
 
     def start_video_thread(self, src="auto"):
-        """
-        Stop any existing thread and start a new VideoThread for `src`.
-        If src == "auto", and the thread emits the specific 'no camera' error,
-        we will automatically open a file dialog so the user can pick a video file.
-        """
-        # stop existing thread cleanly
+        # Stop existing thread
         if hasattr(self, "vthread") and self.vthread is not None:
             try:
                 self.vthread.stop()
@@ -311,30 +357,39 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # create thread and connect signals
-        self.vthread = VideoThread(src=src, width=1280, height=720, target_fps=22.74, loop_video=True)
-        self.vthread.frame_ready.connect(self.update_video_frame)
-        self.vthread.frame_raw.connect(self.on_frame_for_model)
-        self.vthread.connection_changed.connect(self.set_connection_status)
-        self.vthread.video_finished.connect(lambda: self.footer.showMessage("Video finished", 3000))
+        # Try "new" API first (src/width/height...), else fall back to simple (path)
+        try:
+            self.vthread = VideoThread(src=src, width=1280, height=720, target_fps=22.74, loop_video=True)
+            new_api = True
+        except TypeError:
+            cam_or_path = 0 if (isinstance(src, str) and src == "auto") else src
+            self.vthread = VideoThread(cam_or_path)
+            new_api = False
 
-        # handle errors:
-        # - if starting with "auto" we want to open file picker when we get that specific error
-        def _error_handler(msg):
-            # show message in footer always
-            self.footer.showMessage(msg, 5000)
-            # if this was the 'auto' no-camera error, open file picker once
-            if isinstance(src, str) and src == "auto" and "No camera found for 'auto' source" in msg:
-                # run file picker on the UI thread immediately
-                self.on_auto_no_camera()
+        # Connect whichever signals exist
+        if hasattr(self.vthread, "frame"):
+            self.vthread.frame.connect(self.update_video_frame)
+        if hasattr(self.vthread, "frame_ready"):
+            self.vthread.frame_ready.connect(self.update_video_frame)
+        if hasattr(self.vthread, "frame_raw"):
+            self.vthread.frame_raw.connect(self.on_frame_for_model)
 
-        # connect to the thread
-        self.vthread.error.connect(_error_handler)
+        if hasattr(self.vthread, "connection_changed"):
+            self.vthread.connection_changed.connect(self.set_connection_status)
+        if hasattr(self.vthread, "video_finished"):
+            self.vthread.video_finished.connect(lambda: self.footer.showMessage("Video finished", 3000))
 
-        # also allow manual open button to work
-        self.open_video_btn.setEnabled(True)
+        if hasattr(self.vthread, "error"):
+            self.vthread.error.connect(lambda msg: (
+                self.footer.showMessage(msg, 5000),
+                self.on_auto_no_camera() if (isinstance(src, str) and src == "auto"
+                                             and "No camera found for 'auto' source" in msg) else None
+            ))
 
-        # start with high priority if available
+        if hasattr(self.vthread, "debug"):
+            self.vthread.debug.connect(lambda msg: self.footer.showMessage(msg, 4000))
+
+        # Start
         try:
             prio = QThread.HighPriority
         except AttributeError:
@@ -382,7 +437,16 @@ class MainWindow(QMainWindow):
         self._last_frame_qimg = qimg
         # Always just show the base frame; VideoCanvas will overlay if one is set.
         self.video_label.set_frame(qimg)
-
+        # Also feed the model (ModelWorker expects RGB np.ndarray)
+        try:
+            qi = qimg.convertToFormat(QImage.Format_RGB888)
+            w, h = qi.width(), qi.height()
+            ptr = qi.constBits()
+            ptr.setsize(h * qi.bytesPerLine())
+            arr = np.frombuffer(ptr, np.uint8).reshape(h, qi.bytesPerLine() // 3, 3)[:, :w, :]
+            self.on_frame_for_model(arr)
+        except Exception:
+            pass
         # --- detect black/blank frame (simple, fast heuristic) ---
         is_black = True
         BLACK_THR = 12  # 0..255, increase to be less strict
@@ -430,40 +494,43 @@ class MainWindow(QMainWindow):
             # don't break the video display if topbar isn't available yet
             pass
 
-    # camera connected status → flip pill color
-    def set_connection_status(self, connected: bool):
-        pill = self.topbar.record_wrap
-        pill.setProperty("connected", connected)
-        pill.style().unpolish(pill);
-        pill.style().polish(pill);
-        pill.update()
+        if not getattr(self, "_camera_connected", False):
+            self._camera_connected = True
+            self.set_connection_status(True)
 
-        # also colorize left “Keine Kamera” label via CSS property
+        # Convert QImage → numpy RGB and send to model
         try:
-            self.topbar.camera_label.setProperty("connected", connected)
-            self.topbar.camera_label.style().unpolish(self.topbar.camera_label)
-            self.topbar.camera_label.style().polish(self.topbar.camera_label)
-            self.topbar.camera_label.update()
-            self.topbar.camera_label.setText("Kamera verbunden" if connected else "Keine Kamera")
+            qimg = qimg.convertToFormat(QImage.Format_RGB888)
+            w, h = qimg.width(), qimg.height()
+            ptr = qimg.bits()
+            ptr.setsize(qimg.bytesPerLine() * h)
+            arr = np.frombuffer(ptr, np.uint8).reshape((h, qimg.bytesPerLine() // 3, 3))[:, :w, :]
+            if hasattr(self, "model_worker"):
+                self.model_worker.feed_frame(arr.copy())
         except Exception:
             pass
 
+    # camera connected status → flip pill color
+    def set_connection_status(self, connected: bool):
+        self.topbar.set_camera_connected(connected)
+
     # ROI button behavior
     def on_roi_toggled(self, checked: bool):
-        if checked:
-            ok = self.video_label.begin_annotation(self._note_counter)
-            if not ok:
-                self.roi_btn.setChecked(False)
-        else:
-            self.video_label.cancel_annotation()
+        #VideoCanvas exposes set_roi_mode(), not begin_annotation/cancel_annotation
+        self.video_label.set_roi_mode(checked)
 
-    # When a ROI is marked in the video
-    def on_roi_marked(self, label_num: int):
+    # When user clicks the frame in ROI mode
+    def on_roi_marked(self, x: int, y: int):
+        idx = self._note_counter  # current note number
+        self.video_label.add_marker(x, y, idx)  # pass it to the canvas
+
         t = QDateTime.currentDateTime().toString("yyyy.MM.dd HH:mm")
         text = self.comment.text().strip() or "Auffälligkeit"
-        line = f"#{label_num} {t} – {text}"
+        line = f"#{idx} {t} – {text}"
         self.notes_view.appendPlainText(line)
-        self._note_counter = label_num + 1
+
+        self._note_counter += 1
         self.roi_btn.setChecked(False)
         self.comment.clear()
+
 
