@@ -23,7 +23,6 @@ def run():
 
 
 def _exception_hook(exc_type, exc_value, exc_traceback):
-    # fall back to default printing; integrating with a logger is also fine
     import traceback, sys as _sys
     traceback.print_exception(exc_type, exc_value, exc_traceback, file=_sys.stderr)
 

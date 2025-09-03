@@ -1,4 +1,4 @@
-# video_thread.py — unified API
+# video_thread.py — unified API with frame_id for perfect sync
 from __future__ import annotations
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
@@ -11,14 +11,14 @@ import os
 class VideoThread(QThread):
     """
     Emits:
-      - frame_ready(QImage RGB888)  : for painting in UI
-      - frame_raw(object np.uint8)  : (H,W,3) RGB for model
+      - frame_ready(QImage RGB888, int frame_id)  : for painting in UI
+      - frame_raw(object np.uint8, int frame_id)  : (H,W,3) RGB for model
       - connection_changed(bool)
       - video_finished()
       - error(str), debug(str)
     """
-    frame_ready = Signal(QImage)
-    frame_raw = Signal(object)
+    frame_ready = Signal(QImage, int)
+    frame_raw = Signal(object, int)
     connection_changed = Signal(bool)
     video_finished = Signal()
     error = Signal(str)
@@ -35,18 +35,19 @@ class VideoThread(QThread):
         self.loop_video = bool(loop_video)
         self._running = False
         self._cap: cv2.VideoCapture | None = None
+        self._frame_id = 0
 
     def _open_capture(self):
         src = self.src
         cap = None
 
         if isinstance(src, str) and src == "auto":
-            cap = cv2.VideoCapture(0)
+            # Prefer a direct camera backend if available to minimize buffering
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if hasattr(cv2, "CAP_DSHOW") else cv2.VideoCapture(0)
             if not cap or not cap.isOpened():
                 self.error.emit("No camera found for 'auto' source")
                 self.connection_changed.emit(False)
                 return None
-            # ↓ Try to minimize internal buffering (supported on some backends)
             try:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except Exception:
@@ -94,17 +95,22 @@ class VideoThread(QThread):
                 self.video_finished.emit()
                 break
 
+            # Increment id for each *captured* frame
+            self._frame_id += 1
+            fid = self._frame_id
+
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-            # Emit raw for model (MainWindow will throttle/pick latest)
+            # Emit raw for model (MainWindow will throttle/lock to pairs)
             try:
-                self.frame_raw.emit(rgb)
+                self.frame_raw.emit(rgb, fid)
             except Exception:
                 pass
 
             h, w, _ = rgb.shape
+            # QImage shares data; copy() when delivering to UI to ensure safety
             qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-            self.frame_ready.emit(qimg)
+            self.frame_ready.emit(qimg, fid)
 
             time.sleep(delay)
 

@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox,
     QSizePolicy
 )
-    # NOTE: QPointF used below
 from PySide6.QtCore import Qt, QSize, QRect, Signal, QPointF
 from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush, QPen, QIcon, QImage, QFont
 
@@ -150,7 +149,6 @@ class Card(QFrame):
 
 
 # ------------------------------- TopBar ------------------------------
-# ------------------------------- TopBar ------------------------------
 class TopBar(QFrame):
     def __init__(self):
         super().__init__()
@@ -244,7 +242,6 @@ class TopBar(QFrame):
         AppState.patient_id = pid or AppState.patient_id
         label_text = pid if pid.startswith("Patient") else f"Patient: {AppState.patient_id}"
         self.patient_pill.setText(label_text)
-
 
 
 # ----------------------------- VideoCanvas ---------------------------
@@ -347,7 +344,6 @@ class VideoCanvas(QLabel):
 
             # --- ROI markers ---
             if self._markers:
-                # marker scale from frame -> target
                 sx = target.width() / max(1, src_w)
                 sy = target.height() / max(1, src_h)
                 pen_x = QPen(QColor(*COLORS.get("light_blue", (64, 184, 255))), 2)

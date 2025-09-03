@@ -5,12 +5,13 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QSlider, QLineEdit, QPlainTextEdit,
     QStatusBar, QFrame, QSizePolicy, QFileDialog, QMessageBox
 )
-from PySide6.QtCore import Qt, QDateTime, QThread, QRect, QTimer
+from PySide6.QtCore import Qt, QDateTime, QThread, QRect
 from PySide6.QtGui import QPixmap, QImage, QPalette, QColor, QPainter
 
 from datetime import datetime
 import os
 import numpy as np
+from typing import Dict, Optional
 
 from .video_thread import VideoThread
 from .widgets import Card, TopBar, Switch, CircularProgress, VideoCanvas, AppState
@@ -19,6 +20,14 @@ from .colors import COLORS
 
 
 class MainWindow(QMainWindow):
+    """
+    Latency-synchronized pipeline:
+
+    - VideoThread emits frames with a monotonically increasing frame_id.
+    - We pass exactly one "latest" frame to the model when the worker is idle.
+    - ModelWorker returns an overlay with the SAME frame_id.
+    - UI only draws (frame, overlay) pairs with matching ids. Result: no visual drift.
+    """
     def __init__(self):
         super().__init__()
         os.environ.setdefault("QT_SCALE_FACTOR", "1.25")
@@ -26,12 +35,19 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Intraoperative Assistenz - Harnblase")
 
         # ---- latency control state ----
-        self._latest_np_frame: np.ndarray | None = None  # last raw RGB frame from VideoThread
-        self._inflight = False                           # True while model is working
+        self._latest_np_frame: Optional[np.ndarray] = None  # newest raw RGB frame
+        self._latest_frame_id: Optional[int] = None         # newest frame id
+        self._inflight: bool = False                        # True while model is working
+        self._inflight_id: Optional[int] = None             # frame id currently processed
         self._model_ready = False
         self._pending_video_src: str | int | None = None
         self._camera_connected = False
         self._note_counter = 1
+
+        # Pair stores: wait until we have BOTH frame and overlay for the same id.
+        self._frames: Dict[int, QImage] = {}
+        self._overlays: Dict[int, QImage] = {}
+        self._last_displayed_id: Optional[int] = None
 
         central = QWidget(); self.setCentralWidget(central)
         outer = QVBoxLayout(central); outer.setContentsMargins(0,0,0,0); outer.setSpacing(8)
@@ -108,20 +124,24 @@ class MainWindow(QMainWindow):
 
         # Model worker (HAC)
         from .model_worker import ModelWorker
-        self.model_worker = ModelWorker(target_fps=5, max_queue=2)
+        self.model_worker = ModelWorker(target_fps=None, max_queue=2)  # event-driven, no timer
         self.model_worker.overlay_ready.connect(self.on_overlay_ready)
         self.model_worker.debug.connect(lambda msg: self.footer.showMessage(msg, 5000))
         self.model_worker.error.connect(lambda msg: self.footer.showMessage(msg, 7000))
         self.model_worker.started_ok.connect(self.on_model_ready)
-        self.model_worker.start()
 
-        # Internal frame/overlay cache
+        # start worker at top priority
+        try:
+            self.model_worker.start(QThread.TimeCriticalPriority)
+        except Exception:
+            self.model_worker.start()
+
+        # Internal frame/overlay cache (for screenshot composition)
         self._last_frame_qimg: QImage | None = None
         self._last_overlay_qimg: QImage | None = None
 
         # Start note
         self.footer.showMessage("Lade Modell …")
-
 
         # Slider / ROI / Comment
         self.overlay_slider = QSlider(Qt.Horizontal)
@@ -158,12 +178,6 @@ class MainWindow(QMainWindow):
 
         self.roi_btn.toggled.connect(self.on_roi_toggled)
         self.video_label.roiClicked.connect(self.on_roi_marked)
-
-        # --- latency pump timer (start after UI widgets exist) ---
-        self._infer_timer = QTimer(self)
-        self._infer_timer.setInterval(180)  # ~5.5 Hz
-        self._infer_timer.timeout.connect(self._pump_latest_to_model)
-        self._infer_timer.start()
 
         video_card.inner_layout.addLayout(slider_row)
         video_card.inner_layout.addLayout(roi_row)
@@ -238,26 +252,65 @@ class MainWindow(QMainWindow):
         root.addWidget(left_wrap, 2)
         root.addWidget(right_wrap, 3)
 
-        # Internal frame/overlay cache
-        self._last_frame_qimg: QImage | None = None
-        self._last_overlay_qimg: QImage | None = None
-
         # Start note: model loads, start video when ready
         self.footer.showMessage("Lade Modell …")
 
-    # ---------------- latency pump ----------------
-    def _pump_latest_to_model(self):
-        # send only if: model is ready, overlay is enabled, we have a frame, and nothing is running
+    # ---------------- core sync helpers ----------------
+    def _maybe_dispatch_inference(self):
+        """If model idle and we have a fresh frame, start inference immediately."""
         if not self._model_ready or not self.vessel_toggle.isChecked():
             return
-        if self._inflight or self._latest_np_frame is None:
+        if self._inflight:
+            return
+        if self._latest_np_frame is None or self._latest_frame_id is None:
             return
         try:
             self._inflight = True
-            # non-blocking call into your worker; it will do one inference
-            self.model_worker.feed_frame(self._latest_np_frame)
+            self._inflight_id = self._latest_frame_id
+            self.model_worker.feed_frame(self._latest_np_frame, self._latest_frame_id)
         except Exception:
-            self._inflight = False  # fail-safe
+            self._inflight = False
+            self._inflight_id = None
+
+    def _display_pair_if_ready(self, frame_id: int):
+        """If we have both frame and overlay for frame_id, show them atomically."""
+        f = self._frames.get(frame_id)
+        o = self._overlays.get(frame_id)
+        if f is None or o is None:
+            return False
+
+        # Draw the exact pair: no drift.
+        self._last_frame_qimg = f
+        self._last_overlay_qimg = o if self.vessel_toggle.isChecked() else None
+
+        self.video_label.set_frame(f)
+        if self.vessel_toggle.isChecked():
+            self.video_label.set_overlay(o)
+            self.video_label.set_overlay_opacity(self.overlay_slider.value() / 100.0)
+        else:
+            self.video_label.clear_overlay()
+
+        self._last_displayed_id = frame_id
+
+        # Drop all older cached items to keep memory tiny
+        to_drop = [k for k in self._frames.keys() if k < frame_id]
+        for k in to_drop:
+            self._frames.pop(k, None)
+        to_drop = [k for k in self._overlays.keys() if k < frame_id]
+        for k in to_drop:
+            self._overlays.pop(k, None)
+
+        # Keep cache bounded (paranoia)
+        if len(self._frames) > 8:
+            oldest = sorted(self._frames.keys())[:-4]
+            for k in oldest:
+                self._frames.pop(k, None)
+        if len(self._overlays) > 8:
+            oldest = sorted(self._overlays.keys())[:-4]
+            for k in oldest:
+                self._overlays.pop(k, None)
+
+        return True
 
     # ---------------- slots ----------------
     def on_model_ready(self):
@@ -285,32 +338,42 @@ class MainWindow(QMainWindow):
                 4000
             )
 
-    def on_frame_for_model(self, np_frame: np.ndarray):
-        # DO NOT forward every frame to the model anymore — just store the newest.
-        # The QTimer pump above will send only the latest one and only when idle.
+    def on_frame_for_model(self, np_frame: np.ndarray, frame_id: int):
+        # Always store newest raw frame
         self._latest_np_frame = np_frame
+        self._latest_frame_id = frame_id
+        # Fire inference immediately if idle
+        self._maybe_dispatch_inference()
 
-    def on_overlay_ready(self, overlay_qimg: QImage):
-        # inference finished – allow the next one
+    def on_overlay_ready(self, overlay_qimg: QImage, frame_id: int):
+        # Inference finished; record overlay and try to draw the matching pair.
         self._inflight = False
+        self._inflight_id = None
 
-        self._last_overlay_qimg = overlay_qimg
+        self._overlays[frame_id] = overlay_qimg
         if self.vessel_toggle.isChecked():
-            self.video_label.set_overlay(overlay_qimg)
-            self.video_label.set_overlay_opacity(self.overlay_slider.value() / 100.0)
+            self._display_pair_if_ready(frame_id)
+
+        # If a newer frame is already waiting, start it right away.
+        if self._latest_frame_id is not None and (self._latest_frame_id > frame_id):
+            self._maybe_dispatch_inference()
 
     def _on_vessel_toggle(self, on: bool):
         # toggle both model emission & UI overlay
         if hasattr(self, "model_worker"):
             self.model_worker.set_enabled(on)
+
         if not on:
+            # fall back to raw live frames (no overlay waiting)
             self.video_label.clear_overlay()
             if self._last_frame_qimg is not None:
                 self.video_label.set_frame(self._last_frame_qimg)
         else:
-            if self._last_overlay_qimg is not None:
-                self.video_label.set_overlay(self._last_overlay_qimg)
-                self.video_label.set_overlay_opacity(self.overlay_slider.value() / 100.0)
+            # if we already have a matching pair for the last frame, draw it
+            if self._latest_frame_id is not None:
+                if not self._display_pair_if_ready(self._latest_frame_id):
+                    # else, kick inference to get a pair
+                    self._maybe_dispatch_inference()
 
     def closeEvent(self, event):
         try:
@@ -343,8 +406,8 @@ class MainWindow(QMainWindow):
         try:
             self.vthread = VideoThread(
                 src=src,
-                width=None,          # <- do not adapt/resize
-                height=None,         # <- do not adapt/resize
+                width=None,
+                height=None,
                 target_fps=None,     # use source FPS if available
                 loop_video=True
             )
@@ -352,7 +415,7 @@ class MainWindow(QMainWindow):
             cam_or_path = 0 if (isinstance(src, str) and src == "auto") else src
             self.vthread = VideoThread(cam_or_path)
 
-        # Connect signals
+        # Connect signals (now include frame_id)
         self.vthread.frame_ready.connect(self.update_video_frame)
         self.vthread.frame_raw.connect(self.on_frame_for_model)
         self.vthread.connection_changed.connect(self.set_connection_status)
@@ -362,9 +425,9 @@ class MainWindow(QMainWindow):
 
         # Start with high priority
         try:
-            prio = QThread.HighPriority
+            prio = QThread.TimeCriticalPriority
         except AttributeError:
-            prio = QThread.Priority.HighPriority
+            prio = QThread.HighPriority
         self.vthread.start(prio)
 
     # Handle 'auto' no camera
@@ -386,17 +449,27 @@ class MainWindow(QMainWindow):
         self._last_video_dir = os.path.dirname(path)
         self.start_video_thread(path)
 
-    # video frame (QImage)
-    def update_video_frame(self, qimg: QImage):
-        self._last_frame_qimg = qimg
-        self.video_label.set_frame(qimg)
+    # video frame (QImage + id)
+    def update_video_frame(self, qimg: QImage, frame_id: int):
+        # Cache for pairing
+        self._frames[frame_id] = qimg
 
-        # Black/blank detection (fast heuristic)
+        # For black/blank detection & screenshots keep references to the *latest drawn*.
+        # If overlay disabled, draw raw immediately; if enabled, wait for overlay pair.
+        if self.vessel_toggle.isChecked():
+            if self._display_pair_if_ready(frame_id):
+                pass  # drawn with overlay
+        else:
+            self._last_frame_qimg = qimg
+            self.video_label.set_frame(qimg)
+
+        # Fast black detection heuristic on the *drawn* frame when available
+        drawn = self._last_frame_qimg if self._last_frame_qimg is not None else qimg
         is_black = True
         BLACK_THR = 12
         try:
-            if qimg and not qimg.isNull() and qimg.width() > 0 and qimg.height() > 0:
-                w, h = qimg.width(), qimg.height()
+            if drawn and not drawn.isNull() and drawn.width() > 0 and drawn.height() > 0:
+                w, h = drawn.width(), drawn.height()
                 sample_coords = [
                     (w // 2, h // 2),
                     (w // 4, h // 2),
@@ -405,7 +478,7 @@ class MainWindow(QMainWindow):
                     (w // 2, 3 * h // 4),
                 ]
                 for (sx, sy) in sample_coords:
-                    c = qimg.pixelColor(int(sx), int(sy))
+                    c = drawn.pixelColor(int(sx), int(sy))
                     if (c.red() > BLACK_THR) or (c.green() > BLACK_THR) or (c.blue() > BLACK_THR):
                         is_black = False
                         break
@@ -451,7 +524,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Screenshot", "Kein Frame verfügbar.")
             return
 
-        # base as RGB888
         base = self._last_frame_qimg.convertToFormat(QImage.Format_RGB888)
         result = base.copy()
         painter = QPainter(result)
@@ -461,10 +533,8 @@ class MainWindow(QMainWindow):
             painter.setOpacity(self.overlay_slider.value() / 100.0)
 
             if ov.size() == base.size():
-                # 1:1 draw (no scaling)
                 painter.drawImage(0, 0, ov)
             else:
-                # Letterbox-fit (KeepAspectRatio) centered, no expanding/cropping
                 bw, bh = base.width(), base.height()
                 ow, oh = ov.width(), ov.height()
                 if ow > 0 and oh > 0:
@@ -480,7 +550,6 @@ class MainWindow(QMainWindow):
 
         painter.end()
 
-        # Ensure folder exists
         out_dir = os.path.join(os.getcwd(), "screenshots")
         os.makedirs(out_dir, exist_ok=True)
 

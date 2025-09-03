@@ -1,14 +1,19 @@
-# model_worker.py — robust model importer + safe dummy overlay
+# model_worker.py — robust model importer + latency-synced overlay (emits with frame_id)
 from __future__ import annotations
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 import numpy as np
 import queue, time, os, importlib
-from typing import Optional
+from typing import Optional, Tuple
 
 try:
     import torch
     TORCH_OK = True
+    torch.set_grad_enabled(False)
+    try:
+        torch.backends.cudnn.benchmark = True  # speed up convs on fixed-size inputs
+    except Exception:
+        pass
 except Exception:
     torch = None  # type: ignore
     TORCH_OK = False
@@ -32,7 +37,7 @@ def _import_first(names: list[str]):
 class ModelWorker(QThread):
     started_ok = Signal()
     started = Signal()
-    overlay_ready = Signal(QImage)
+    overlay_ready = Signal(QImage, int)  # (overlay_qimage, frame_id)
     debug = Signal(str)
     error = Signal(str)
 
@@ -42,7 +47,7 @@ class ModelWorker(QThread):
         device: Optional[str] = None,
         input_size: tuple[int, int] = (512, 512),
         color_rgba: tuple[int, int, int, int] = (0, 140, 255, 180),
-        target_fps: Optional[float] = None,
+        target_fps: Optional[float] = None,   # optional pacing, but UI is event-driven
         max_queue: int = 1,
         attn_ckpt: Optional[str] = None,
         unet_ckpt: Optional[str] = None,
@@ -59,26 +64,30 @@ class ModelWorker(QThread):
         self.target_delay = (1.0 / float(target_fps)) if (target_fps and target_fps > 0) else None
 
         import queue as _q
-        self._q: "_q.Queue[np.ndarray | None]" = _q.Queue(maxsize=max(1, int(max_queue)))
+        # Queue holds tuples: (frame_rgb_np, frame_id)
+        self._q: "_q.Queue[Tuple[np.ndarray | None, Optional[int]]]" = _q.Queue(maxsize=max(1, int(max_queue)))
         self._running = False
         self._enabled = True
         self._model = None
         self._use_dummy = not TORCH_OK  # if no torch, force dummy
 
     # ---------------- public API ----------------
-    def feed_frame(self, rgb_frame: np.ndarray) -> None:
+    def feed_frame(self, rgb_frame: np.ndarray, frame_id: int) -> None:
         if not isinstance(rgb_frame, np.ndarray) or rgb_frame.ndim != 3:
             return
         try:
             if self._q.full():
                 _ = self._q.get_nowait()
-            self._q.put_nowait(rgb_frame)
+            self._q.put_nowait((rgb_frame, frame_id))
         except Exception:
             pass
 
-    # Backward-compat
+    # Backward-compat (signature kept but frame_id missing → ignored)
     def enqueue_frame(self, rgb_frame: np.ndarray) -> None:
-        self.feed_frame(rgb_frame)
+        try:
+            self.feed_frame(rgb_frame, -1)
+        except Exception:
+            pass
 
     def set_enabled(self, on: bool) -> None:
         self._enabled = bool(on)
@@ -86,7 +95,7 @@ class ModelWorker(QThread):
     # ---------------- thread ----------------
     def run(self):
         self._running = True
-        self._log("ModelWorker starting…")
+        self._log(f"ModelWorker starting on device={self.device} …")
         try:
             if not self._use_dummy:
                 self._load_model()
@@ -100,19 +109,19 @@ class ModelWorker(QThread):
         last_emit = 0.0
         while self._running:
             try:
-                frame = self._q.get(timeout=0.25)
+                frame, fid = self._q.get(timeout=0.25)
             except Exception:
                 continue
-            if frame is None:
+            if frame is None or fid is None:
                 continue
 
             try:
                 if not self._enabled:
-                    # Emit transparent overlay of same size
+                    # Emit transparent overlay of same size so UI can "pair" and still draw raw frame if desired
                     h, w, _ = frame.shape
                     empty = QImage(w, h, QImage.Format_RGBA8888)
                     empty.fill(0)
-                    self.overlay_ready.emit(empty)
+                    self.overlay_ready.emit(empty, int(fid))
                     continue
 
                 if self.target_delay is not None:
@@ -122,7 +131,7 @@ class ModelWorker(QThread):
                         time.sleep(wait)
 
                 qimg = self._infer_overlay(frame)
-                self.overlay_ready.emit(qimg)
+                self.overlay_ready.emit(qimg, int(fid))
                 last_emit = time.time()
             except Exception as e:
                 self.error.emit(f"Inference error: {e}")
@@ -133,7 +142,7 @@ class ModelWorker(QThread):
     def stop(self):
         self._running = False
         try:
-            self._q.put_nowait(None)
+            self._q.put_nowait((None, None))
         except Exception:
             pass
         try:
@@ -210,7 +219,9 @@ class ModelWorker(QThread):
             mask = (mag > 0.25).astype(np.uint8)
         else:
             import PIL.Image as PILImage
-            with torch.no_grad():  # type: ignore
+            # autocast to speed up on CUDA
+            autocast = torch.cuda.amp.autocast if (self.device == "cuda") else torch.cpu.amp.autocast  # type: ignore[attr-defined]
+            with torch.no_grad(), autocast():
                 img = PILImage.fromarray(frame).resize(self.input_size)
                 x = np.asarray(img).astype(np.float32) / 255.0
                 x = np.transpose(x, (2, 0, 1))[None, ...]
