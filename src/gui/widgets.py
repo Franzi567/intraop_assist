@@ -1,12 +1,25 @@
 from __future__ import annotations
 from typing import List, Tuple
+
 from PySide6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox,
     QSizePolicy
 )
+    # NOTE: QPointF used below
 from PySide6.QtCore import Qt, QSize, QRect, Signal, QPointF
 from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush, QPen, QIcon, QImage, QFont
+
 from .colors import COLORS
+
+
+# --------------------------- Simple global app state ---------------------------
+
+class AppState:
+    """
+    Minimal shared state for the GUI. Keeps patient_id globally so
+    other modules (e.g., MainWindow for screenshots) can access it.
+    """
+    patient_id: str = "ID_042"
 
 
 # ------------------------- Circular Progress -------------------------
@@ -39,7 +52,9 @@ class CircularProgress(QWidget):
 
         # label
         p.setPen(QColor(*COLORS.get("gray", (80, 80, 80))))
-        font = p.font(); font.setPointSize(14); font.setBold(True)
+        font = p.font()
+        font.setPointSize(14)
+        font.setBold(True)
         p.setFont(font)
         p.drawText(rect, Qt.AlignCenter, f"{self.value}%\nAbdeckung")
 
@@ -135,6 +150,7 @@ class Card(QFrame):
 
 
 # ------------------------------- TopBar ------------------------------
+# ------------------------------- TopBar ------------------------------
 class TopBar(QFrame):
     def __init__(self):
         super().__init__()
@@ -144,10 +160,10 @@ class TopBar(QFrame):
         root.setContentsMargins(16, 8, 16, 8)
         root.setSpacing(12)
 
-        # LEFT cluster
+        # LEFT cluster (flush-left)
         left = QHBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(8)
+        left.setSpacing(0)  # no gap between icon and title as requested
 
         cam = QLabel("🎥")
         left.addWidget(cam, 0, Qt.AlignVCenter)
@@ -157,19 +173,23 @@ class TopBar(QFrame):
         title.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         left.addWidget(title, 0, Qt.AlignVCenter)
 
+        # tiny manual gap before the "Demo" badge
+        gap = QWidget(); gap.setFixedWidth(8)
+        left.addWidget(gap)
+
         demo = QLabel("Demo")
         demo.setObjectName("Badge_Demo")
         demo.setProperty("small", True)
         demo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         left.addWidget(demo, 0, Qt.AlignVCenter)
 
-        left_wrap = QWidget(); left_wrap.setLayout(left)
-        root.addWidget(left_wrap, 1)
+        # RIGHT cluster (stays on the right)
+        right = QHBoxLayout()
+        right.setSpacing(12)
 
-        # RIGHT cluster
-        right = QHBoxLayout(); right.setSpacing(12)
-
-        self.patient_pill = QLabel("Patient: ID-042")
+        # Initialize patient id globally
+        AppState.patient_id = "ID_042"
+        self.patient_pill = QLabel(f"Patient: {AppState.patient_id}")
         self.patient_pill.setObjectName("PatientPill")
         right.addWidget(self.patient_pill)
 
@@ -195,8 +215,10 @@ class TopBar(QFrame):
         self.shot_btn.setIcon(QIcon("src/gui/icons/image.png"))
         right.addWidget(self.shot_btn)
 
-        right_wrap = QWidget(); right_wrap.setLayout(right)
-        root.addWidget(right_wrap, 0, Qt.AlignRight)
+        # Layout order: LEFT | (stretch) | RIGHT
+        root.addLayout(left, 0)
+        root.addStretch(1)
+        root.addLayout(right, 0)
 
         # initial
         self.set_camera_connected(False)
@@ -219,7 +241,10 @@ class TopBar(QFrame):
         """)
 
     def set_patient_id(self, pid: str):
-        self.patient_pill.setText(pid if pid.startswith("Patient") else f"Patient: {pid}")
+        AppState.patient_id = pid or AppState.patient_id
+        label_text = pid if pid.startswith("Patient") else f"Patient: {AppState.patient_id}"
+        self.patient_pill.setText(label_text)
+
 
 
 # ----------------------------- VideoCanvas ---------------------------
@@ -235,14 +260,15 @@ class VideoCanvas(QLabel):
         super().__init__()
         self.setObjectName("VideoCanvas")
         self.setAlignment(Qt.AlignCenter)
-        self._overlay: QImage | None = None         # RGBA
+        self._frame: QImage | None = None           # raw frame
+        self._overlay: QImage | None = None         # RGBA overlay (same or different size)
         self._overlay_opacity: float = 0.7
         self._roi_mode: bool = False
         self._markers: List[Tuple[QPointF, str]] = []
 
     # ---------- public API ----------
     def set_frame(self, qimg: QImage):
-        self.setPixmap(QPixmap.fromImage(qimg))
+        self._frame = qimg
         self.update()
 
     def set_overlay(self, qimg_rgba: QImage | None):
@@ -272,75 +298,77 @@ class VideoCanvas(QLabel):
         self._markers.clear()
         self.update()
 
+    # ---------- helpers ----------
+    def _calc_draw_rect(self, src_w: int, src_h: int) -> QRect:
+        """Return letterboxed target rect where a (src_w, src_h) image should be drawn."""
+        lab_w, lab_h = self.width(), self.height()
+        if src_w <= 0 or src_h <= 0 or lab_w <= 0 or lab_h <= 0:
+            return QRect(0, 0, 0, 0)
+        scale = min(lab_w / src_w, lab_h / src_h)
+        draw_w = int(src_w * scale)
+        draw_h = int(src_h * scale)
+        off_x = (lab_w - draw_w) // 2
+        off_y = (lab_h - draw_h) // 2
+        return QRect(off_x, off_y, draw_w, draw_h)
+
     # ---------- events ----------
     def mousePressEvent(self, ev):
-        if self._roi_mode and self.pixmap():
-            px = self.pixmap()
-            if not px:
+        if self._roi_mode and self._frame is not None:
+            src_w, src_h = self._frame.width(), self._frame.height()
+            tr = self._calc_draw_rect(src_w, src_h)
+            if tr.width() > 0 and tr.height() > 0:
+                # map click back to frame coordinates
+                x = int((ev.position().x() - tr.x()) * (src_w / tr.width()))
+                y = int((ev.position().y() - tr.y()) * (src_h / tr.height()))
+                if 0 <= x < src_w and 0 <= y < src_h:
+                    self.roiClicked.emit(x, y)
                 return
-            pix_w, pix_h = px.width(), px.height()
-            lab_w, lab_h = self.width(), self.height()
-            scale = min(lab_w / pix_w, lab_h / pix_h)
-            draw_w, draw_h = int(pix_w * scale), int(pix_h * scale)
-            off_x = (lab_w - draw_w) // 2
-            off_y = (lab_h - draw_h) // 2
-            x = int((ev.position().x() - off_x) / scale)
-            y = int((ev.position().y() - off_y) / scale)
-            if 0 <= x < pix_w and 0 <= y < pix_h:
-                self.roiClicked.emit(x, y)
-        else:
-            super().mousePressEvent(ev)
+        super().mousePressEvent(ev)
 
     def paintEvent(self, ev):
-        super().paintEvent(ev)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
 
-        # --- overlay (scaled to the drawn image rect) ---
-        if self._overlay is not None and self.pixmap():
-            px = self.pixmap()
-            pix_w, pix_h = px.width(), px.height()
-            lab_w, lab_h = self.width(), self.height()
-            scale = min(lab_w / pix_w, lab_h / pix_h)
-            draw_w, draw_h = int(pix_w * scale), int(pix_h * scale)
-            off_x = (lab_w - draw_w) // 2
-            off_y = (lab_h - draw_h) // 2
+        # fill background (in case of letterboxing)
+        p.fillRect(self.rect(), self.palette().window())
 
-            painter.setOpacity(self._overlay_opacity)
-            target = QRect(off_x, off_y, draw_w, draw_h)
-            painter.drawImage(target, self._overlay)
-            painter.setOpacity(1.0)
+        # --- base frame, letterboxed, no cropping ---
+        if self._frame is not None and not self._frame.isNull():
+            src_w, src_h = self._frame.width(), self._frame.height()
+            target = self._calc_draw_rect(src_w, src_h)
+            if target.width() > 0 and target.height() > 0:
+                p.drawImage(target, self._frame)
 
-        # --- ROI markers ---
-        if self._markers and self.pixmap():
-            px = self.pixmap()
-            pix_w, pix_h = px.width(), px.height()
-            lab_w, lab_h = self.width(), self.height()
-            scale = min(lab_w / pix_w, lab_h / pix_h)
-            draw_w, draw_h = int(pix_w * scale), int(pix_h * scale)
-            off_x = (lab_w - draw_w) // 2
-            off_y = (lab_h - draw_h) // 2
+            # --- overlay (same target rect mapping) ---
+            if self._overlay is not None and not self._overlay.isNull():
+                p.setOpacity(self._overlay_opacity)
+                p.drawImage(target, self._overlay)
+                p.setOpacity(1.0)
 
-            pen_x = QPen(QColor(*COLORS.get("light_blue", (64, 184, 255))), 2)
-            painter.setPen(pen_x)
+            # --- ROI markers ---
+            if self._markers:
+                # marker scale from frame -> target
+                sx = target.width() / max(1, src_w)
+                sy = target.height() / max(1, src_h)
+                pen_x = QPen(QColor(*COLORS.get("light_blue", (64, 184, 255))), 2)
+                p.setPen(pen_x)
 
-            font = painter.font()
-            font.setPointSize(11)
-            font.setBold(True)
-            painter.setFont(font)
+                font = p.font()
+                font.setPointSize(11)
+                font.setBold(True)
+                p.setFont(font)
 
-            for p, label_str in self._markers:
-                painter.setPen(pen_x)
-                x = off_x + int(p.x() * scale)
-                y = off_y + int(p.y() * scale)
+                for point, label_str in self._markers:
+                    x = target.x() + int(point.x() * sx)
+                    y = target.y() + int(point.y() * sy)
+                    s = 10
+                    p.setPen(pen_x)
+                    p.drawLine(x - s, y - s, x + s, y + s)
+                    p.drawLine(x - s, y + s, x + s, y - s)
 
-                s = 10
-                painter.drawLine(x - s, y - s, x + s, y + s)
-                painter.drawLine(x - s, y + s, x + s, y - s)
+                    p.setPen(QPen(QColor(0, 0, 0, 200)))
+                    p.drawText(x + s + 5, y - s - 2, label_str)
+                    p.setPen(QPen(QColor(255, 255, 255)))
+                    p.drawText(x + s + 4, y - s - 3, label_str)
 
-                painter.setPen(QPen(QColor(0, 0, 0, 200)))
-                painter.drawText(x + s + 5, y - s - 2, label_str)
-                painter.setPen(QPen(QColor(255, 255, 255)))
-                painter.drawText(x + s + 4, y - s - 3, label_str)
-
-        painter.end()
+        p.end()

@@ -24,14 +24,9 @@ class VideoThread(QThread):
     error = Signal(str)
     debug = Signal(str)
 
-    def __init__(
-        self,
-        src: str | int = "auto",
-        width: int | None = None,
-        height: int | None = None,
-        target_fps: float | None = None,
-        loop_video: bool = True,
-    ):
+    def __init__(self, src: str | int = "auto", width: int | None = None,
+                 height: int | None = None, target_fps: float | None = None,
+                 loop_video: bool = True):
         super().__init__()
         self.src = src
         self.width = int(width) if width else None
@@ -41,10 +36,9 @@ class VideoThread(QThread):
         self._running = False
         self._cap: cv2.VideoCapture | None = None
 
-    # ----- internals -----
     def _open_capture(self):
         src = self.src
-        cap: cv2.VideoCapture | None = None
+        cap = None
 
         if isinstance(src, str) and src == "auto":
             cap = cv2.VideoCapture(0)
@@ -52,6 +46,11 @@ class VideoThread(QThread):
                 self.error.emit("No camera found for 'auto' source")
                 self.connection_changed.emit(False)
                 return None
+            # ↓ Try to minimize internal buffering (supported on some backends)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
         elif isinstance(src, str):
             if not os.path.exists(src):
                 self.error.emit(f"Video file not found: {src}")
@@ -60,17 +59,18 @@ class VideoThread(QThread):
             cap = cv2.VideoCapture(src)
         else:
             cap = cv2.VideoCapture(int(src))
+            if cap and cap.isOpened():
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
 
         if not cap or not cap.isOpened():
             self.error.emit("Failed to open video source.")
             self.connection_changed.emit(False)
             return None
 
-        # For cameras: try to set resolution
-        if self.width and self.height and (not isinstance(src, str) or src == "auto"):
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-
+        # Keep native resolution — no forced resizing (prevents “zoomed” look)
         self.connection_changed.emit(True)
         return cap
 
@@ -88,7 +88,6 @@ class VideoThread(QThread):
         while self._running:
             ok, frame_bgr = self._cap.read()
             if not ok:
-                # If file and looping, restart; else end
                 if isinstance(self.src, str) and self.src != "auto" and self.loop_video:
                     self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
@@ -96,24 +95,19 @@ class VideoThread(QThread):
                 break
 
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            if self.width and self.height:
-                rgb = cv2.resize(rgb, (self.width, self.height), interpolation=cv2.INTER_AREA)
 
-            # Emit raw to model
+            # Emit raw for model (MainWindow will throttle/pick latest)
             try:
                 self.frame_raw.emit(rgb)
             except Exception:
                 pass
 
-            # Emit QImage to UI
             h, w, _ = rgb.shape
             qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
             self.frame_ready.emit(qimg)
 
-            # Pace
             time.sleep(delay)
 
-        # Cleanup
         try:
             if self._cap is not None:
                 self._cap.release()
@@ -125,10 +119,7 @@ class VideoThread(QThread):
         self._running = False
         try:
             if self._cap is not None:
-                try:
-                    self._cap.release()
-                except Exception:
-                    pass
+                self._cap.release()
         except Exception:
             pass
         try:
